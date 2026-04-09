@@ -2,7 +2,6 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Qiskit Ecosystem](https://img.shields.io/badge/Qiskit-Ecosystem-blueviolet)](https://github.com/Qiskit/ecosystem)
 
 **Qiskit TREV** is a GPU-accelerated quantum circuit simulation plugin for Qiskit, built on NVIDIA cuQuantum. It provides efficient variational quantum algorithm (VQA) simulation using tensor ring (periodic Matrix Product State) representations, powered natively by cuStateVec and cuTensorNet instead of PyTorch.
 
@@ -118,7 +117,7 @@ qiskit_trev/
 | **Backend** | PyTorch | NVIDIA cuQuantum (cuStateVec + cuTensorNet) |
 | **Interface** | Custom `Circuit` API | Qiskit `BackendV2` / Primitives |
 | **Autodiff** | PyTorch autograd | Parameter-shift / cuQuantum adjoint |
-| **Ecosystem** | Standalone | Qiskit Ecosystem plugin |
+| **Ecosystem** | Standalone | Qiskit plugin |
 | **Install** | `pip install TREV` | `pip install qiskit-trev` |
 
 ## Contributing
@@ -148,4 +147,4 @@ If you use qiskit-trev in your research, please cite:
 
 ## Acknowledgments
 
-This project builds on [TREV](https://github.com/keunjunpark/TREV) and integrates with the [Qiskit Ecosystem](https://github.com/Qiskit/ecosystem).
+This project builds on [TREV](https://github.com/keunjunpark/TREV).
