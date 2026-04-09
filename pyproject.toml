@@ -35,11 +35,28 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
 ]
+ci = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/keunjunpark/qiskit-trev"
 Repository = "https://github.com/keunjunpark/qiskit-trev"
 Issues = "https://github.com/keunjunpark/qiskit-trev/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires NVIDIA GPU with CUDA",
+]
+
+[tool.coverage.run]
+source = ["qiskit_trev"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 80
 
 [tool.setuptools.packages.find]
 where = ["src"]
