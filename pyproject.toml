@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "qiskit-trev"
+version = "0.1.0"
+description = "GPU-accelerated tensor ring VQA simulation plugin for Qiskit, powered by NVIDIA cuQuantum"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Keunjun Park" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "qiskit>=1.0",
+    "numpy>=1.23.0",
+    "cupy>=12.0.0",
+    "cuquantum>=23.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/keunjunpark/qiskit-trev"
+Repository = "https://github.com/keunjunpark/qiskit-trev"
+Issues = "https://github.com/keunjunpark/qiskit-trev/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
