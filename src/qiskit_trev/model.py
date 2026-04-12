@@ -93,6 +93,42 @@ class TensorRingModel(torch.nn.Module):
         return torch.tensor(ev, dtype=torch.float64)
 
     @torch.no_grad()
+    def evaluate_batch(
+        self, params_batch: Tensor, batch_size: int | None = None
+    ) -> Tensor:
+        """Evaluate expectation values for a batch of parameter sets.
+
+        Args:
+            params_batch: (B, P) tensor of parameter values.
+            batch_size: Chunk size for batched building. None = all at once.
+
+        Returns:
+            (B,) tensor of expectation values.
+        """
+        B = params_batch.shape[0]
+        if batch_size is None:
+            batch_size = B
+
+        evs = torch.zeros(B, dtype=torch.float64)
+
+        for start in range(0, B, batch_size):
+            stop = min(start + batch_size, B)
+            chunk = params_batch[start:stop]
+
+            state = TensorRingState(
+                self._num_qubits, self.rank, self.device_str, self.dtype
+            )
+            batch_tensor = state.build_batch(self._gate_templates, chunk)
+
+            for i in range(chunk.shape[0]):
+                if self._use_efficient:
+                    evs[start + i] = ev_efficient(batch_tensor[i], self._hamiltonian)
+                else:
+                    evs[start + i] = ev_full(batch_tensor[i], self._hamiltonian)
+
+        return evs
+
+    @torch.no_grad()
     def parameter_shift_grad(
         self, params: Tensor, shift: float = math.pi / 2
     ) -> Tensor:

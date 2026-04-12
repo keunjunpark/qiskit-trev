@@ -1,4 +1,4 @@
-"""CMA-ES optimizer with unified interface."""
+"""CMA-ES optimizer with unified interface and batched evaluation."""
 
 from __future__ import annotations
 
@@ -20,6 +20,8 @@ class CMAESOptimizer(Optimizer):
         sigma: Initial step size. Typical: 0.5-1.0.
         pop_size: Population size per generation. None = auto.
         eigen_every: Eigendecomposition frequency.
+        eval_batch_size: Batch size for evaluating population members.
+            None = evaluate all at once. Set smaller to control GPU memory.
     """
 
     def __init__(
@@ -27,8 +29,10 @@ class CMAESOptimizer(Optimizer):
         sigma: float = 0.5,
         pop_size: int | None = None,
         eigen_every: int = 1,
+        eval_batch_size: int | None = None,
     ):
         self._cma = CMAES(sigma=sigma, pop_size=pop_size, eigen_every=eigen_every)
+        self._eval_batch_size = eval_batch_size
 
     @torch.no_grad()
     def minimize(
@@ -44,13 +48,10 @@ class CMAESOptimizer(Optimizer):
         s['mean'] = theta0.double().to(device)
 
         cost_history: list[float] = []
+        eval_bs = self._eval_batch_size
 
         def evaluate_fn(population: Tensor) -> Tensor:
-            lam = population.shape[0]
-            costs = torch.zeros(lam, dtype=torch.float32)
-            for i in range(lam):
-                costs[i] = model(population[i]).item()
-            return costs
+            return model.evaluate_batch(population, batch_size=eval_bs).float()
 
         best_cost = float('inf')
         best_params = theta0.clone()
