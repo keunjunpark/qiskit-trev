@@ -7,5 +7,19 @@
 """Qiskit TREV: GPU-accelerated tensor ring VQA simulation via PyTorch."""
 
 from .tensor_ring import TensorRingState, GateInstruction
+from .model import TensorRingModel
+from .estimator import TREVEstimator
+from .sampler import TREVSampler
+from .hamiltonian import Hamiltonian
+from .converter import circuit_to_gate_instructions, sparse_pauli_op_to_hamiltonian
 
-__all__ = ["TensorRingState", "GateInstruction"]
+__all__ = [
+    "TensorRingState",
+    "GateInstruction",
+    "TensorRingModel",
+    "TREVEstimator",
+    "TREVSampler",
+    "Hamiltonian",
+    "circuit_to_gate_instructions",
+    "sparse_pauli_op_to_hamiltonian",
+]
