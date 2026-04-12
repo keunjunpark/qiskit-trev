@@ -4,4 +4,8 @@
 #
 # This code is licensed under the MIT License.
 
-"""Qiskit TREV: GPU-accelerated tensor ring VQA simulation via NVIDIA cuQuantum."""
+"""Qiskit TREV: GPU-accelerated tensor ring VQA simulation via PyTorch."""
+
+from .tensor_ring import TensorRingState, GateInstruction
+
+__all__ = ["TensorRingState", "GateInstruction"]
