@@ -82,6 +82,75 @@ def apply_double_qubit_gate(
     return new_a, new_b
 
 
+def apply_single_qubit_gate_batch(gate_matrix_batch: Tensor, core_batch: Tensor) -> Tensor:
+    """Apply single-qubit gates to a batch of tensor ring cores.
+
+    Args:
+        gate_matrix_batch: (B, 2, 2) batch of gate matrices.
+        core_batch: (B, chi1, chi2, 2) batch of cores.
+
+    Returns:
+        Updated batch of cores, shape (B, chi1, chi2, 2).
+    """
+    # (B, 2, [2]) @ (B, chi1, chi2, [2]) → (B, 2, chi1, chi2)
+    result = torch.einsum('bij,bklj->bikl', gate_matrix_batch, core_batch)
+    # → (B, chi1, chi2, 2)
+    return result.permute(0, 2, 3, 1)
+
+
+def apply_double_qubit_gate_batch(
+    gate_matrix: Tensor,
+    core_a_batch: Tensor,
+    core_b_batch: Tensor,
+    max_rank: int | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Apply a two-qubit gate to a batch of adjacent tensor ring core pairs via SVD.
+
+    Args:
+        gate_matrix: (4, 4) or (B, 4, 4) gate matrix.
+        core_a_batch: (B, chi1, chi2, 2) batch of cores for qubit a.
+        core_b_batch: (B, chi2, chi3, 2) batch of cores for qubit b.
+        max_rank: Max bond dimension. Defaults to chi1.
+
+    Returns:
+        Tuple of updated batched cores.
+    """
+    B, chi1, chi2, _ = core_a_batch.shape
+    _, chi2_, chi3, _ = core_b_batch.shape
+    assert chi2 == chi2_, "Bond mismatch between the two site tensors"
+
+    if max_rank is None:
+        max_rank = min(chi1, chi3)
+
+    # Merge: (B, chi1, [chi2], 2) × (B, [chi2], chi3, 2) → (B, chi1, 2, chi3, 2)
+    mps = torch.einsum('bikp,bkjq->bijpq', core_a_batch, core_b_batch)
+
+    # Apply gate
+    g = gate_matrix
+    if g.ndim == 2:
+        g = g.expand(B, -1, -1)
+    else:
+        assert g.shape[0] == B
+
+    mps = mps.reshape(B, chi1 * chi3, 4)
+    mps = torch.bmm(mps, g.transpose(1, 2))
+    mps = mps.view(B, chi1, chi3, 2, 2)
+
+    mps = mps.permute(0, 3, 1, 4, 2).reshape(B, 2 * chi1, 2 * chi3)
+
+    # Batched SVD
+    u, s, vh = torch.linalg.svd(mps)
+    k = min(max_rank, s.shape[-1])
+    x = u[:, :, :k]
+    sx = torch.diag_embed(s[:, :k]).to(torch.cfloat)
+    y = vh[:, :k, :]
+
+    new_a = torch.bmm(x, sx).reshape(B, 2, chi1, k).permute(0, 2, 3, 1)
+    new_b = y.reshape(B, k, 2, chi3).permute(0, 1, 3, 2)
+
+    return new_a, new_b
+
+
 def swap_gate_matrix(matrix: Tensor) -> Tensor:
     """Permute qubit labels in a 4x4 gate: SWAP @ matrix @ SWAP.
 

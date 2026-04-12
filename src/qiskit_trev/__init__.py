@@ -12,6 +12,7 @@ from .estimator import TREVEstimator
 from .sampler import TREVSampler
 from .hamiltonian import Hamiltonian
 from .converter import circuit_to_gate_instructions, sparse_pauli_op_to_hamiltonian
+from .gradient import BatchParameterShiftGradient
 
 __all__ = [
     "TensorRingState",
@@ -20,6 +21,7 @@ __all__ = [
     "TREVEstimator",
     "TREVSampler",
     "Hamiltonian",
+    "BatchParameterShiftGradient",
     "circuit_to_gate_instructions",
     "sparse_pauli_op_to_hamiltonian",
 ]
