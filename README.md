@@ -3,29 +3,28 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Qiskit TREV** is a GPU-accelerated quantum circuit simulation plugin for Qiskit, built on NVIDIA cuQuantum. It provides efficient variational quantum algorithm (VQA) simulation using tensor ring (periodic Matrix Product State) representations, powered natively by cuStateVec and cuTensorNet instead of PyTorch.
+**Qiskit TREV** is a GPU-accelerated quantum circuit simulation plugin for Qiskit, built on PyTorch. It provides efficient variational quantum algorithm (VQA) simulation using tensor ring (periodic Matrix Product State) representations, powered by PyTorch's GPU acceleration.
 
 ## Features
 
 - **Tensor Ring Architecture**: Efficient quantum state representation using periodic Matrix Product States
-- **NVIDIA cuQuantum Backend**: Native GPU acceleration via cuStateVec and cuTensorNet (no PyTorch dependency)
+- **PyTorch Backend**: GPU acceleration via PyTorch tensors and CUDA
 - **Qiskit Integration**: Works seamlessly as a Qiskit plugin with `BackendV2` interface
 - **Multiple Measurement Methods**:
   - Full Contraction
   - Perfect Sampling
   - Efficient Contraction
   - Right Suffix Contraction
-- **Variational Algorithm Support**: Built-in gradient computation and parameter-shift rules
+- **Variational Algorithm Support**: Built-in parameter-shift rule gradient computation
 - **Hamiltonian Operations**: Full support for Pauli string Hamiltonians via `SparsePauliOp`
 
 ## Requirements
 
 - Python 3.10+
 - NVIDIA GPU with CUDA support
-- [cuQuantum](https://developer.nvidia.com/cuquantum-sdk) (cuStateVec + cuTensorNet)
+- [PyTorch](https://pytorch.org/) with CUDA
 - Qiskit >= 1.0
 - NumPy
-- CuPy
 
 ## Installation
 
@@ -99,7 +98,7 @@ qiskit_trev/
 ├── sampler.py                # TREVSampler (Qiskit Sampler primitive)
 ├── tensor_ring/              # Core tensor ring engine
 │   ├── state.py              # Tensor ring state representation
-│   ├── contraction.py        # cuTensorNet contraction routines
+│   ├── contraction.py        # Tensor contraction routines
 │   └── gates.py              # Gate-to-tensor decomposition
 ├── measure/                  # Measurement strategies
 │   ├── full_contraction.py
@@ -114,9 +113,9 @@ qiskit_trev/
 
 | | TREV | qiskit-trev |
 |---|---|---|
-| **Backend** | PyTorch | NVIDIA cuQuantum (cuStateVec + cuTensorNet) |
+| **Backend** | PyTorch | PyTorch |
 | **Interface** | Custom `Circuit` API | Qiskit `BackendV2` / Primitives |
-| **Autodiff** | PyTorch autograd | Parameter-shift / cuQuantum adjoint |
+| **Gradients** | Parameter-shift rule | Parameter-shift rule |
 | **Ecosystem** | Standalone | Qiskit plugin |
 | **Install** | `pip install TREV` | `pip install qiskit-trev` |
 
@@ -139,7 +138,7 @@ If you use qiskit-trev in your research, please cite:
 
 ```bibtex
 @software{qiskit_trev,
-  title={qiskit-trev: GPU-Accelerated Tensor Ring VQA Simulation for Qiskit},
+  title={qiskit-trev: PyTorch-based Tensor Ring VQA Simulation for Qiskit},
   author={Park, Keunjun},
   url={https://github.com/keunjunpark/qiskit-trev},
 }
