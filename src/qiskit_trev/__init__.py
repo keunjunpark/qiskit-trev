@@ -13,6 +13,7 @@ from .sampler import TREVSampler
 from .hamiltonian import Hamiltonian
 from .converter import circuit_to_gate_instructions, sparse_pauli_op_to_hamiltonian
 from .gradient import BatchParameterShiftGradient
+from .measure.bitstring import argmax_bitstring
 from .optimization import CMAESOptimizer, GradientOptimizer, OptimizationResult
 from .optimization.cma_es import CMAES, minimize_cma_es
 
@@ -29,6 +30,7 @@ __all__ = [
     "OptimizationResult",
     "CMAES",
     "minimize_cma_es",
+    "argmax_bitstring",
     "circuit_to_gate_instructions",
     "sparse_pauli_op_to_hamiltonian",
 ]
