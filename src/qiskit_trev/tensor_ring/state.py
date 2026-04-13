@@ -246,6 +246,14 @@ class TensorRingState:
         N = self.num_qubits
         rank = self.rank
 
+        # Auto-assign param_indices when not explicitly provided
+        param_idx = 0
+        for instr in gates:
+            if instr.params and not instr.param_indices:
+                indices = tuple(range(param_idx, param_idx + len(instr.params)))
+                instr.param_indices = indices
+            param_idx += len(instr.params)
+
         # Initialize batched |0...0> state
         single = torch.zeros(
             (N, rank, rank, 2), dtype=self.dtype, device=self.device
