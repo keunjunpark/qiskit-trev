@@ -16,6 +16,7 @@ from .gradient import BatchParameterShiftGradient
 from .measure.bitstring import argmax_bitstring
 from .optimization import CMAESOptimizer, GradientOptimizer, OptimizationResult
 from .optimization.cma_es import CMAES, minimize_cma_es
+from .qml import QMLModel
 
 __all__ = [
     "TensorRingState",
@@ -33,4 +34,5 @@ __all__ = [
     "argmax_bitstring",
     "circuit_to_gate_instructions",
     "sparse_pauli_op_to_hamiltonian",
+    "QMLModel",
 ]
