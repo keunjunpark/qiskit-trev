@@ -220,8 +220,9 @@ class QMLModel:
     ) -> Tensor:
         """Compute d<Z_q>/dtheta_i for all qubits, params, and data points.
 
-        Builds base params once, applies all shifts via vectorized scatter,
-        evaluates everything in one mega _measure_all_qubits call.
+        Follows TREV's auto_batch_size pattern: probe GPU once with the
+        actual param-shift workload to find maximum params-per-chunk,
+        then stream chunks through GPU at full capacity.
 
         Args:
             X: (N, n_features) data.
@@ -234,29 +235,54 @@ class QMLModel:
         P = self.n_trainable
         N = X.shape[0]
         dev = torch.device(self.device)
-
-        # Build base params once
-        base = self._build_param_batch(X, theta)  # (N, P_total)
-
-        # Create (2P, N, P_total) by tiling base
-        mega = base.unsqueeze(0).expand(2 * P, -1, -1).clone()
-
-        # Apply shifts via vectorized scatter — no Python loop over P
-        plus_rows = torch.arange(0, 2 * P, 2, device=dev)
-        minus_rows = torch.arange(1, 2 * P, 2, device=dev)
-        # Shift the trainable param at position p for row 2p (plus) and 2p+1 (minus)
-        # Each plus_rows[p] shifts self._train_idx[p] by +shift
-        for p in range(P):
-            mega[plus_rows[p], :, self._train_idx[p]] += shift
-            mega[minus_rows[p], :, self._train_idx[p]] -= shift
-
-        mega = mega.reshape(2 * P * N, -1)  # (2*P*N, P_total)
-
-        all_evs = self._measure_all_qubits(mega)  # (Q, 2*P*N)
-        all_evs = all_evs.view(self.n_qubits, P, 2, N)
-
         denom = 2 * math.sin(shift)
-        return (all_evs[:, :, 0, :] - all_evs[:, :, 1, :]) / denom
+
+        # Build base params once — (N, P_total) on GPU
+        base = self._build_param_batch(X, theta)
+
+        # ── Auto-tune params_per_chunk (TREV pattern) ─────────────────
+        # Probe with actual workload: alloc (2C, N, P_total) + measure
+        if not hasattr(self, '_ps_chunk') or self._ps_chunk is None:
+            from .optimization.auto_batch import auto_batch_size as _abs
+
+            def _probe(C):
+                C = min(C, P)
+                if C < 1:
+                    return
+                blk = base.unsqueeze(0).expand(2 * C, -1, -1).clone()
+                for j in range(C):
+                    blk[2*j, :, self._train_idx[j]] += shift
+                    blk[2*j+1, :, self._train_idx[j]] -= shift
+                blk = blk.reshape(2 * C * N, -1)
+                self._measure_all_qubits(blk)
+
+            self._ps_chunk = _abs(
+                _probe, dev, min_bs=1, max_bs=P,
+                safety_frac=0.85, warmup=1,
+            )
+
+        chunk_size = self._ps_chunk
+
+        # ── Compute gradients in chunks ───────────────────────────────
+        grad = torch.zeros(self.n_qubits, P, N, dtype=torch.float64, device=dev)
+
+        for start in range(0, P, chunk_size):
+            stop = min(start + chunk_size, P)
+            C = stop - start
+
+            blk = base.unsqueeze(0).expand(2 * C, -1, -1).clone()
+            for j, p in enumerate(range(start, stop)):
+                blk[2*j, :, self._train_idx[p]] += shift
+                blk[2*j+1, :, self._train_idx[p]] -= shift
+
+            blk = blk.reshape(2 * C * N, -1)
+            evs = self._measure_all_qubits(blk)
+            evs = evs.view(self.n_qubits, C, 2, N)
+            grad[:, start:stop, :] = (evs[:, :, 0, :] - evs[:, :, 1, :]) / denom
+
+            del blk, evs
+
+        return grad
 
     @torch.no_grad()
     def forward_population(self, X: Tensor, pop_thetas: Tensor) -> Tensor:
