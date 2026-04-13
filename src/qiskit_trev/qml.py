@@ -303,3 +303,8 @@ class QMLModel:
         mega = self._build_mega_batch(X, pop_thetas)
         all_evs = self._measure_all_qubits(mega)  # (Q, ps*N)
         return all_evs.view(self.n_qubits, ps, N)
+    
+    def predict(self, X, theta, W, b):
+        """Class predictions (numpy). Convenience for evaluation."""
+        evs = self.forward(X, theta)
+        return torch.tanh(W.to(self.device) @ evs + b.to(self.device).unsqueeze(1)).argmax(0).cpu().numpy()
