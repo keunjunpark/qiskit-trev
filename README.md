@@ -42,53 +42,13 @@ cd qiskit-trev
 pip install -e ".[dev]"
 ```
 
-## Quick Start
+## Tutorials
 
-```python
-from qiskit.circuit import QuantumCircuit
-from qiskit_trev import TREVBackend
+See the [`tutorials/`](tutorials/) directory for Jupyter notebooks:
 
-# Create a Qiskit circuit
-qc = QuantumCircuit(4)
-qc.h(0)
-qc.rx(0.5, 1)
-qc.ry(0.3, 2)
-qc.cx(0, 3)
-
-# Run on TREV backend with tensor ring rank
-backend = TREVBackend(rank=10, device="cuda")
-job = backend.run(qc, shots=10000)
-result = job.result()
-counts = result.get_counts()
-```
-
-### Expectation Values with VQE
-
-```python
-from qiskit.circuit import QuantumCircuit, Parameter
-from qiskit.quantum_info import SparsePauliOp
-from qiskit_trev import TREVEstimator
-
-# Parameterized ansatz
-theta = [Parameter(f"t{i}") for i in range(4)]
-qc = QuantumCircuit(4)
-for i in range(4):
-    qc.h(i)
-    qc.ry(theta[i], i)
-
-# Hamiltonian
-hamiltonian = SparsePauliOp.from_list([
-    ("ZZII", 1.0),
-    ("IZZI", 0.5),
-    ("IIZZ", 0.5),
-])
-
-# GPU-accelerated expectation value
-estimator = TREVEstimator(rank=10, device="cuda")
-job = estimator.run([(qc, hamiltonian, [0.1, 0.2, 0.3, 0.4])])
-result = job.result()
-print(f"Expectation value: {result[0].data.evs}")
-```
+1. **[Getting Started](tutorials/01_getting_started.ipynb)** — Circuits, sampling, and the TREV backend
+2. **[Expectation Values](tutorials/02_expectation_values.ipynb)** — Hamiltonians, estimator, and measurement methods
+3. **[VQE Optimization](tutorials/03_vqe_optimization.ipynb)** — Gradient descent and CMA-ES for variational algorithms
 
 ## Architecture
 
