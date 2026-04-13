@@ -57,10 +57,13 @@ class QMLModel:
         self._gate_templates, self._total_slots = circuit_to_gate_instructions(circuit)
 
         # Precompute index tensors for vectorized param construction
-        n_features = len(set(range(len(data_indices))))  # = len(data_indices)
+        # n_features = number of unique data features (= n_qubits for data re-uploading)
+        # data_indices cycles through features: [0,1,...,Q-1, 0,1,...,Q-1, ...]
+        # so n_features = n_qubits, and feat_idx maps each data slot to its feature column
+        n_features = self.n_qubits
         self._data_idx = torch.tensor(data_indices, dtype=torch.long, device=device)
         self._feat_idx = torch.tensor(
-            [i % len(data_indices) for i in range(len(data_indices))],
+            [i % n_features for i in range(len(data_indices))],
             dtype=torch.long, device=device,
         )
         self._train_idx = torch.tensor(trainable_indices, dtype=torch.long, device=device)
