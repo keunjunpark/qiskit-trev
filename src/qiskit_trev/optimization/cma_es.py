@@ -191,11 +191,7 @@ def minimize_cma_es(
 
     def evaluate_fn(population: Tensor) -> Tensor:
         """Evaluate a population of parameter vectors."""
-        lam = population.shape[0]
-        costs = torch.zeros(lam, dtype=torch.float32)
-        for i in range(lam):
-            costs[i] = model(population[i]).item()
-        return costs
+        return model.evaluate_batch(population).float()
 
     for gen in range(generations):
         best_cost, best_params = cma._step(s, evaluate_fn)

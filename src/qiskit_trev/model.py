@@ -16,7 +16,9 @@ from .converter import circuit_to_gate_instructions, sparse_pauli_op_to_hamilton
 from .tensor_ring.state import TensorRingState, GateInstruction
 from .hamiltonian import Hamiltonian
 from .measure.efficient_contraction import expectation_value as ev_efficient
+from .measure.efficient_contraction import batched_expectation_value as batched_ev_efficient
 from .measure.full_contraction import expectation_value as ev_full
+from .measure.full_contraction import batched_expectation_value as batched_ev_full
 
 
 class TensorRingModel(torch.nn.Module):
@@ -109,7 +111,7 @@ class TensorRingModel(torch.nn.Module):
         if batch_size is None:
             batch_size = B
 
-        evs = torch.zeros(B, dtype=torch.float64)
+        evs = torch.zeros(B, dtype=torch.float64, device=torch.device(self.device_str))
 
         for start in range(0, B, batch_size):
             stop = min(start + batch_size, B)
@@ -120,26 +122,29 @@ class TensorRingModel(torch.nn.Module):
             )
             batch_tensor = state.build_batch(self._gate_templates, chunk)
 
-            for i in range(chunk.shape[0]):
-                if self._use_efficient:
-                    evs[start + i] = ev_efficient(batch_tensor[i], self._hamiltonian)
-                else:
-                    evs[start + i] = ev_full(batch_tensor[i], self._hamiltonian)
+            if self._use_efficient:
+                evs[start:stop] = batched_ev_efficient(batch_tensor, self._hamiltonian)
+            else:
+                evs[start:stop] = batched_ev_full(batch_tensor, self._hamiltonian)
 
         return evs
 
     @torch.no_grad()
     def parameter_shift_grad(
-        self, params: Tensor, shift: float = math.pi / 2
+        self,
+        params: Tensor,
+        shift: float = math.pi / 2,
+        batch_size: int | None = None,
     ) -> Tensor:
         """Compute gradient via parameter-shift rule.
 
-        For each parameter i:
-            grad[i] = (E(theta + shift*e_i) - E(theta - shift*e_i)) / (2*sin(shift))
+        Builds all 2*P shifted parameter sets and evaluates them in one
+        batched call instead of 2*P sequential forward passes.
 
         Args:
             params: (P,) tensor of circuit parameter values.
             shift: Shift amount (default pi/2 for standard gates).
+            batch_size: Chunk size for evaluate_batch. None = all at once.
 
         Returns:
             (P,) tensor of gradients.
@@ -148,17 +153,60 @@ class TensorRingModel(torch.nn.Module):
         if P == 0:
             return torch.zeros(0, dtype=torch.float64)
 
-        grad = torch.zeros(P, dtype=torch.float64)
         denom = 2 * math.sin(shift)
 
+        # Build (2*P, P) shifted parameter matrix
+        shifted = params.unsqueeze(0).expand(2 * P, -1).clone()
+        idx = torch.arange(P)
+        shifted[idx, idx] += shift
+        shifted[P + idx, idx] -= shift
+
+        evs = self.evaluate_batch(shifted, batch_size=batch_size)
+        grad = (evs[:P] - evs[P:]) / denom
+
+        return grad.cpu()
+
+    @torch.no_grad()
+    def parameter_shift_grad_batch(
+        self,
+        params_batch: Tensor,
+        shift: float = math.pi / 2,
+        batch_size: int | None = None,
+    ) -> Tensor:
+        """Compute gradient for N data points at once.
+
+        For each sample n and each parameter i, shifts parameter i by +/-shift
+        and evaluates all 2*P*N circuits in one batched call.
+
+        Args:
+            params_batch: (N, P) tensor — different param vectors per sample.
+            shift: Shift amount (default pi/2).
+            batch_size: Chunk size for evaluate_batch. None = all at once.
+
+        Returns:
+            (N, P) gradient tensor.
+        """
+        N, P = params_batch.shape
+        if P == 0:
+            return torch.zeros(N, 0, dtype=torch.float64)
+
+        denom = 2 * math.sin(shift)
+
+        # Build (2*P*N, P) mega-batch: for each param i, stack plus/minus shifted
+        all_shifted = []
         for i in range(P):
-            params_plus = params.clone()
-            params_plus[i] += shift
-            params_minus = params.clone()
-            params_minus[i] -= shift
+            plus = params_batch.clone()
+            plus[:, i] += shift
+            minus = params_batch.clone()
+            minus[:, i] -= shift
+            all_shifted.append(plus)
+            all_shifted.append(minus)
 
-            ev_plus = self.forward(params_plus).item()
-            ev_minus = self.forward(params_minus).item()
-            grad[i] = (ev_plus - ev_minus) / denom
+        mega = torch.cat(all_shifted, dim=0)  # (2*P*N, P)
+        evs = self.evaluate_batch(mega, batch_size=batch_size)  # (2*P*N,)
 
-        return grad
+        # Reshape: (P, 2, N) — for each param, plus then minus, across N samples
+        evs = evs.view(P, 2, N)
+        grad = (evs[:, 0, :] - evs[:, 1, :]) / denom  # (P, N)
+
+        return grad.T.cpu()  # (N, P)
