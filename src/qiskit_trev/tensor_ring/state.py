@@ -52,10 +52,14 @@ class GateInstruction:
         name: Gate name (e.g., "H", "RX", "CNOT").
         qubits: Tuple of qubit indices. Length 1 for single-qubit, 2 for two-qubit.
         params: Parameter values for parameterized gates. Empty for fixed gates.
+        param_indices: Original parameter indices in the circuit parameter vector.
+            Used by build_batch to index into params_batch correctly even
+            after gate fusion reorders the processing order.
     """
     name: str
     qubits: tuple[int, ...]
     params: tuple[float, ...] = ()
+    param_indices: tuple[int, ...] = ()
 
 
 def _get_gate_matrix(instr: GateInstruction, device: str) -> Tensor:
@@ -250,17 +254,15 @@ class TensorRingState:
         tensor = single.unsqueeze(0).expand(B, -1, -1, -1, -1).clone()
 
         ops = _compile_fused_ops(gates)
-        param_idx = 0
 
         for op_type, payload in ops:
             if op_type == 'block1q':
                 for qubit, instrs in payload.items():
                     fused = None
                     for instr in instrs:
-                        mat, p_consumed = self._get_batch_gate_matrix(
-                            instr, params_batch, param_idx, B
+                        mat = self._get_batch_gate_matrix(
+                            instr, params_batch, B
                         )
-                        param_idx += p_consumed
                         fused = mat if fused is None else torch.bmm(mat, fused)
                     tensor[:, qubit] = apply_single_qubit_gate_batch(
                         fused, tensor[:, qubit]
@@ -275,55 +277,57 @@ class TensorRingState:
                         f"requires adjacent qubits in the ring topology."
                     )
 
-                matrix, p_consumed = self._get_batch_gate_matrix_2q(
-                    instr, params_batch, param_idx, B
+                matrix = self._get_batch_gate_matrix_2q(
+                    instr, params_batch, B
                 )
-                param_idx += p_consumed
                 self._apply_two_qubit_gate_batch(tensor, matrix, q0, q1)
 
         return tensor
 
     def _get_batch_gate_matrix(
-        self, instr: GateInstruction, params_batch: Tensor, param_idx: int, B: int
-    ) -> tuple[Tensor, int]:
+        self, instr: GateInstruction, params_batch: Tensor, B: int
+    ) -> Tensor:
         """Get batched gate matrix for a single-qubit gate.
 
-        Returns (batch_matrix, num_params_consumed).
+        Uses instr.param_indices to index into params_batch correctly,
+        preserving the original circuit parameter ordering even after
+        gate fusion reorders the processing order.
         """
         name = instr.name
 
         if name in _GATE_MAP_0Q:
             mat = _GATE_MAP_0Q[name](device=self.device)
-            return mat.unsqueeze(0).expand(B, -1, -1).clone(), 0
+            return mat.unsqueeze(0).expand(B, -1, -1).clone()
 
         if name in _GATE_MAP_1P:
-            theta_batch = params_batch[:, param_idx]
+            theta_batch = params_batch[:, instr.param_indices[0]]
             mat = _GATE_MAP_1P[name](theta_batch, device=self.device)
-            return mat, 1
+            return mat
 
         if name == "U3":
-            p = params_batch[:, param_idx:param_idx + 3]
+            idx = list(instr.param_indices)
+            p = params_batch[:, idx]
             mat = gate_fns.U3(p, device=self.device)
-            return mat, 3
+            return mat
 
         raise ValueError(f"Unknown 1q gate: {name}")
 
     def _get_batch_gate_matrix_2q(
-        self, instr: GateInstruction, params_batch: Tensor, param_idx: int, B: int
-    ) -> tuple[Tensor, int]:
-        """Get gate matrix for a two-qubit gate (same for all batch elements).
+        self, instr: GateInstruction, params_batch: Tensor, B: int
+    ) -> Tensor:
+        """Get gate matrix for a two-qubit gate.
 
-        Returns (matrix, num_params_consumed).
+        Uses instr.param_indices for parameterized two-qubit gates.
         """
         name = instr.name
 
         if name in _GATE_MAP_2Q_FIXED:
-            return _GATE_MAP_2Q_FIXED[name](device=self.device), 0
+            return _GATE_MAP_2Q_FIXED[name](device=self.device)
 
         if name in _GATE_MAP_2Q_PARAM:
-            theta_batch = params_batch[:, param_idx]
+            theta_batch = params_batch[:, instr.param_indices[0]]
             mat = _GATE_MAP_2Q_PARAM[name](theta_batch, device=self.device)
-            return mat, 1
+            return mat
 
         raise ValueError(f"Unknown 2q gate: {name}")
 

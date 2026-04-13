@@ -82,14 +82,16 @@ def circuit_to_gate_instructions(
         if name in _QISKIT_PARAM_1Q:
             our_name, n_params = _QISKIT_PARAM_1Q[name]
             params = tuple(float(p) for p in op.params[:n_params])
-            gates.append(GateInstruction(our_name, qubits, params))
+            pidx = tuple(range(total_params, total_params + n_params))
+            gates.append(GateInstruction(our_name, qubits, params, pidx))
             total_params += n_params
             continue
 
         # U3/U gate
         if name in _QISKIT_U3_NAMES:
             params = tuple(float(p) for p in op.params[:3])
-            gates.append(GateInstruction('U3', qubits, params))
+            pidx = tuple(range(total_params, total_params + 3))
+            gates.append(GateInstruction('U3', qubits, params, pidx))
             total_params += 3
             continue
 
@@ -102,7 +104,8 @@ def circuit_to_gate_instructions(
         if name in _QISKIT_PARAM_2Q:
             our_name, n_params = _QISKIT_PARAM_2Q[name]
             params = tuple(float(p) for p in op.params[:n_params])
-            gates.append(GateInstruction(our_name, qubits, params))
+            pidx = tuple(range(total_params, total_params + n_params))
+            gates.append(GateInstruction(our_name, qubits, params, pidx))
             total_params += n_params
             continue
 
