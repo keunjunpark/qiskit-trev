@@ -133,9 +133,9 @@ class TestMinimizeCMAES:
         op = SparsePauliOp.from_list([("Z", 1.0)])
         model = TensorRingModel(qc, op, rank=1, device="cpu")
 
-        cma = CMAES(sigma=0.5, pop_size=8)
+        cma = CMAES(sigma=0.5, pop_size=10)
         theta0 = torch.tensor([0.5])
-        theta, exp_values = minimize_cma_es(model, theta0, cma, generations=30)
+        theta, exp_values = minimize_cma_es(model, theta0, cma, generations=50)
 
         # Should converge toward theta=pi, E=-1
         assert exp_values[-1] < -0.8
