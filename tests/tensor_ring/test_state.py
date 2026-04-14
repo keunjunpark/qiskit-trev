@@ -603,3 +603,127 @@ class TestEdgeCases:
         sv1 = statevector(TensorRingState(2, rank=1).build(gates))
         sv16 = statevector(TensorRingState(2, rank=16).build(gates))
         assert torch.allclose(sv1, sv16, atol=1e-5)
+
+
+class TestGetGateMatrixErrors:
+
+    def test_unknown_gate_raises(self):
+        """_get_gate_matrix with unknown gate name raises ValueError (line 82)."""
+        from qiskit_trev.tensor_ring.state import _get_gate_matrix
+        bad_instr = GateInstruction("UNKNOWN_GATE_XYZ", (0,))
+        with pytest.raises(ValueError, match="Unknown gate"):
+            _get_gate_matrix(bad_instr, "cpu")
+
+
+class TestIsTwoQubit:
+
+    def test_is_two_qubit_true(self):
+        """_is_two_qubit returns True for two-qubit gate (line 90)."""
+        from qiskit_trev.tensor_ring.state import _is_two_qubit
+        instr = GateInstruction("CNOT", (0, 1))
+        assert _is_two_qubit(instr) is True
+
+    def test_is_two_qubit_false(self):
+        """_is_two_qubit returns False for single-qubit gate."""
+        from qiskit_trev.tensor_ring.state import _is_two_qubit
+        instr = GateInstruction("H", (0,))
+        assert _is_two_qubit(instr) is False
+
+
+class TestReversedTwoQubitGate:
+
+    def test_cnot_reversed_qubits_non_batch(self):
+        """CNOT(1, 0): q0 > q1 non-wrap path in build() (lines 228-229)."""
+        state = TensorRingState(num_qubits=3, rank=4)
+        # X on qubit 0 first, then CNOT(1, 0) which is q0=1, q1=0
+        gates = [
+            GateInstruction("X", (0,)),
+            GateInstruction("CNOT", (1, 0)),
+        ]
+        tensor = state.build(gates)
+        sv = statevector(tensor)
+        # CNOT(1, 0): qubit 1 is control, qubit 0 is target
+        # |100> → CNOT(1, 0) → |100> (control=qubit1=0, not flipped)
+        # So state should still be |100>
+        expected = torch.zeros(8, dtype=torch.cfloat)
+        expected[4] = 1.0  # |100> = index 4
+        assert torch.allclose(sv, expected, atol=1e-5)
+
+    def test_cnot_reversed_qubits_batch(self):
+        """CNOT(1, 0) in build_batch(): q0 > q1 non-wrap path (lines 366-369)."""
+        state = TensorRingState(num_qubits=3, rank=4)
+        gates = [
+            GateInstruction("X", (0,), param_indices=()),
+            GateInstruction("CNOT", (1, 0), param_indices=()),
+        ]
+        params = torch.zeros(2, 0)  # 2-batch, no params
+        batch_tensor = state.build_batch(gates, params)
+        assert batch_tensor.shape == (2, 3, 4, 4, 2)
+        # Both results should be |100>
+        for b in range(2):
+            sv = statevector(batch_tensor[b])
+            expected = torch.zeros(8, dtype=torch.cfloat)
+            expected[4] = 1.0
+            assert torch.allclose(sv, expected, atol=1e-5)
+
+    def test_non_adjacent_qubits_batch_raises(self):
+        """Non-adjacent gate in build_batch() raises ValueError (line 283)."""
+        state = TensorRingState(num_qubits=4, rank=4)
+        gates = [GateInstruction("CNOT", (0, 2), param_indices=())]
+        params = torch.zeros(1, 0)
+        with pytest.raises(ValueError, match="requires adjacent qubits"):
+            state.build_batch(gates, params)
+
+
+class TestBatchU3Gate:
+
+    def test_u3_batch(self):
+        """U3 gate in build_batch() hits lines 315-321."""
+        state = TensorRingState(num_qubits=1, rank=1)
+        # Build gate template with param_indices for batch build
+        gates = [
+            GateInstruction("U3", (0,), params=(math.pi / 2, 0.0, 0.0), param_indices=(0, 1, 2))
+        ]
+        params = torch.tensor([[math.pi / 2, 0.0, 0.0]])
+        batch_tensor = state.build_batch(gates, params)
+        sv = statevector(batch_tensor[0])
+        expected = torch.tensor([1, 1], dtype=torch.cfloat) / math.sqrt(2)
+        assert torch.allclose(sv, expected, atol=1e-5)
+
+
+class TestBatchParameterized2QGate:
+
+    def test_zz_gate_batch(self):
+        """ZZ gate in build_batch() hits lines 335-340."""
+        state = TensorRingState(num_qubits=2, rank=4)
+        gates = [
+            GateInstruction("ZZ", (0, 1), params=(0.0,), param_indices=(0,))
+        ]
+        params = torch.tensor([[0.0], [0.1]])
+        batch_tensor = state.build_batch(gates, params)
+        assert batch_tensor.shape == (2, 2, 4, 4, 2)
+        # ZZ(0) on |00> = |00>
+        sv0 = statevector(batch_tensor[0])
+        expected0 = torch.tensor([1, 0, 0, 0], dtype=torch.cfloat)
+        assert torch.allclose(sv0, expected0, atol=1e-5)
+
+
+class TestBatchGateMatrixErrors:
+
+    def test_unknown_1q_gate_in_batch_raises(self):
+        """Unknown 1q gate name in build_batch raises ValueError (line 321)."""
+        state = TensorRingState(num_qubits=1, rank=1)
+        # Create a gate with unknown name and single qubit
+        # param_indices empty, so it will try to look up the gate
+        gates = [GateInstruction("BADGATE_1Q", (0,), params=(), param_indices=())]
+        params = torch.zeros(1, 0)
+        with pytest.raises(ValueError, match="Unknown 1q gate"):
+            state.build_batch(gates, params)
+
+    def test_unknown_2q_gate_in_batch_raises(self):
+        """Unknown 2q gate name in build_batch raises ValueError (line 340)."""
+        state = TensorRingState(num_qubits=2, rank=4)
+        gates = [GateInstruction("BADGATE_2Q", (0, 1), params=(), param_indices=())]
+        params = torch.zeros(1, 0)
+        with pytest.raises(ValueError, match="Unknown 2q gate"):
+            state.build_batch(gates, params)

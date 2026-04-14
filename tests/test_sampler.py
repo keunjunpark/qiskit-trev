@@ -118,3 +118,29 @@ class TestMatchesStatevectorSampler:
             ref_frac = ref_counts.get(key, 0) / shots
             trev_frac = trev_counts.get(key, 0) / shots
             assert abs(ref_frac - trev_frac) < 0.1
+
+
+class TestDefaultShots:
+
+    def test_uses_default_shots_when_none(self):
+        """When shots=None, should use default_shots (line 51)."""
+        qc = QuantumCircuit(1)
+        qc.x(0)
+        qc.measure_all()
+        sampler = TREVSampler(rank=1, default_shots=50)
+        # Don't pass shots → should use default (50)
+        result = sampler.run([qc]).result()
+        counts = result[0].data.meas.get_counts()
+        total = sum(counts.values())
+        assert total == 50
+
+    def test_no_param_circuit_ndim0(self):
+        """No-parameter circuit with ndim==0 params works (line 69)."""
+        qc = QuantumCircuit(1)
+        qc.h(0)
+        qc.measure_all()
+        sampler = TREVSampler(rank=1)
+        result = sampler.run([qc], shots=200).result()
+        counts = result[0].data.meas.get_counts()
+        total = sum(counts.values())
+        assert total == 200

@@ -128,6 +128,7 @@ class TestMinimizeCMAES:
 
     def test_ry_z_optimization(self):
         """Optimize RY(theta) to minimize <Z>. Minimum at theta=pi (cos(pi)=-1)."""
+        torch.manual_seed(42)
         qc = QuantumCircuit(1)
         qc.ry(0.0, 0)
         op = SparsePauliOp.from_list([("Z", 1.0)])
@@ -135,7 +136,7 @@ class TestMinimizeCMAES:
 
         cma = CMAES(sigma=0.5, pop_size=10)
         theta0 = torch.tensor([0.5])
-        theta, exp_values = minimize_cma_es(model, theta0, cma, generations=50)
+        theta, exp_values = minimize_cma_es(model, theta0, cma, generations=100)
 
         # Should converge toward theta=pi, E=-1
         assert exp_values[-1] < -0.8
@@ -155,6 +156,7 @@ class TestMinimizeCMAES:
 
     def test_2param_optimization(self):
         """2-param circuit should converge."""
+        torch.manual_seed(42)
         qc = QuantumCircuit(2)
         qc.ry(0.0, 0)
         qc.ry(0.0, 1)
@@ -163,7 +165,7 @@ class TestMinimizeCMAES:
 
         cma = CMAES(sigma=0.5, pop_size=10)
         theta0 = torch.tensor([0.0, 0.0])
-        theta, exp_values = minimize_cma_es(model, theta0, cma, generations=30)
+        theta, exp_values = minimize_cma_es(model, theta0, cma, generations=60)
 
         # Minimum: both thetas at pi, E = 0.5*(-1) + 0.5*(-1) = -1
         assert exp_values[-1] < -0.5

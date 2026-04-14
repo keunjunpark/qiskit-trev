@@ -220,3 +220,22 @@ class TestSparsePauliOpToHamiltonian:
         h = sparse_pauli_op_to_hamiltonian(op)
         assert len(h.paulis) == 1
         assert abs(h.coefficients[0] - 1.0) < 1e-10
+
+
+class TestConverterErrors:
+
+    def test_unsupported_gate_raises(self):
+        """Unsupported gate should raise ValueError (line 112)."""
+        from qiskit.circuit.library import CCXGate
+        qc = QuantumCircuit(3)
+        qc.append(CCXGate(), [0, 1, 2])
+        with pytest.raises(ValueError, match="Unsupported Qiskit gate"):
+            circuit_to_gate_instructions(qc)
+
+    def test_complex_coefficient_in_sparse_pauli_op(self):
+        """Complex coefficient should be stored as complex (line 137)."""
+        op = SparsePauliOp.from_list([("XY", 1.0 + 0.5j)])
+        h = sparse_pauli_op_to_hamiltonian(op)
+        assert isinstance(h.coefficients[0], complex)
+        assert abs(h.coefficients[0].real - 1.0) < 1e-10
+        assert abs(h.coefficients[0].imag - 0.5) < 1e-10
