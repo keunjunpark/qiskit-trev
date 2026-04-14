@@ -4,6 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![codecov](https://codecov.io/gh/keunjunpark/qiskit-trev/branch/main/graph/badge.svg)](https://codecov.io/gh/keunjunpark/qiskit-trev)
 [![Tests](https://github.com/keunjunpark/qiskit-trev/actions/workflows/test.yml/badge.svg)](https://github.com/keunjunpark/qiskit-trev/actions/workflows/test.yml)
+[![Qiskit Ecosystem](https://qisk.it/e-e2beb4ad)](https://qisk.it/e)
 
 **Qiskit TREV** is a GPU-accelerated quantum circuit simulation plugin for Qiskit, built on PyTorch. It provides efficient variational quantum algorithm (VQA) simulation using tensor ring (periodic Matrix Product State) representations, powered by PyTorch's GPU acceleration.
 
