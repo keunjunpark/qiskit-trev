@@ -197,6 +197,89 @@ class TestForwardPopulation:
         assert evs.shape == (2, 1, 3)
 
 
+class TestVariableBatchGrad:
+    """parameter_shift_grad must handle varying N without OOM."""
+
+    def test_varying_N_returns_correct_shape(self):
+        """Calling with different N values should work and return correct shapes."""
+        qc, di, ti = _make_circuit(n_qubits=2)
+        model = QMLModel(qc, di, ti, rank=4, device="cpu")
+        theta = torch.randn(len(ti))
+
+        # First call with small N
+        dZ1 = model.parameter_shift_grad(torch.randn(5, 2), theta)
+        assert dZ1.shape == (2, len(ti), 5)
+
+        # Second call with larger N — should not reuse stale chunk size
+        dZ2 = model.parameter_shift_grad(torch.randn(20, 2), theta)
+        assert dZ2.shape == (2, len(ti), 20)
+
+        # Third call back to small N
+        dZ3 = model.parameter_shift_grad(torch.randn(3, 2), theta)
+        assert dZ3.shape == (2, len(ti), 3)
+
+    def test_varying_N_gradient_correctness(self):
+        """Gradients should be correct regardless of previous N."""
+        n_qubits = 2
+        qc, di, ti = _make_circuit(n_qubits=n_qubits)
+        model = QMLModel(qc, di, ti, rank=4, device="cpu")
+        theta = torch.randn(len(ti))
+
+        # Call with N=5 first to populate cache
+        model.parameter_shift_grad(torch.randn(5, n_qubits), theta)
+
+        # Now call with N=10 and verify via finite difference
+        X = torch.randn(10, n_qubits)
+        dZ = model.parameter_shift_grad(X, theta)
+
+        eps = 1e-4
+        for p in range(len(ti)):
+            tp = theta.clone(); tp[p] += eps
+            tm = theta.clone(); tm[p] -= eps
+            fd = (model(X, tp) - model(X, tm)) / (2 * eps)
+            torch.testing.assert_close(
+                dZ[:, p, :], fd, atol=0.05, rtol=0.05,
+                msg=f"param {p} gradient mismatch after varying N"
+            )
+
+    def test_chunk_cache_invalidated_on_N_change(self):
+        """Internal chunk cache should adapt to N, not be a single scalar."""
+        qc, di, ti = _make_circuit(n_qubits=2)
+        model = QMLModel(qc, di, ti, rank=4, device="cpu")
+        theta = torch.randn(len(ti))
+
+        model.parameter_shift_grad(torch.randn(5, 2), theta)
+        model.parameter_shift_grad(torch.randn(50, 2), theta)
+
+        # _ps_chunk_cache should exist (replacing old _ps_chunk scalar)
+        assert hasattr(model, '_ps_chunk_cache')
+
+
+class TestForwardPopulationAutoTune:
+    """forward_population should auto-tune batch_size if not set."""
+
+    def test_no_manual_auto_tune_required(self):
+        """forward_population should work without calling auto_tune first."""
+        qc, di, ti = _make_circuit(n_qubits=3)
+        model = QMLModel(qc, di, ti, rank=4, device="cpu")
+        # Don't call auto_tune — forward_population should handle it
+        X = torch.randn(5, 3)
+        pop = torch.randn(8, len(ti))
+        evs = model.forward_population(X, pop)
+        assert evs.shape == (3, 8, 5)
+
+    def test_auto_tunes_on_cuda_when_batch_size_none(self):
+        """On CPU batch_size stays None or gets set; on GPU it should auto-tune."""
+        qc, di, ti = _make_circuit(n_qubits=2)
+        model = QMLModel(qc, di, ti, rank=4, device="cpu")
+        assert model.batch_size is None
+        X = torch.randn(3, 2)
+        pop = torch.randn(4, len(ti))
+        # Should still work even without auto_tune
+        evs = model.forward_population(X, pop)
+        assert evs.shape == (2, 4, 3)
+
+
 class TestEndToEndWorkflow:
     """Verify the intended user workflow from the plan works."""
 

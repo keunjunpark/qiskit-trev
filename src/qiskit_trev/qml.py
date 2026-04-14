@@ -131,13 +131,14 @@ class QMLModel:
         # Step 2: derive _ps_chunk from batch_size
         # Each param-shift chunk processes 2 * chunk * N samples.
         # Max chunk = batch_size // (2 * N), clamped to [1, n_trainable].
-        self._ps_chunk = max(1, min(self.batch_size // (2 * N), self.n_trainable))
+        ps_chunk = max(1, min(self.batch_size // (2 * N), self.n_trainable))
+        self._ps_chunk_cache = {N: ps_chunk}
 
-        n_chunks = math.ceil(self.n_trainable / self._ps_chunk)
+        n_chunks = math.ceil(self.n_trainable / ps_chunk)
         print(f"QMLModel.auto_tune(N={N}):")
         print(f"  batch_size = {self.batch_size:,} samples")
-        print(f"  _ps_chunk  = {self._ps_chunk} params/chunk "
-              f"({self._ps_chunk * 2 * N:,} evals/chunk, {n_chunks} chunks/epoch)")
+        print(f"  _ps_chunk  = {ps_chunk} params/chunk "
+              f"({ps_chunk * 2 * N:,} evals/chunk, {n_chunks} chunks/epoch)")
 
     def _build_param_batch(self, X: Tensor, theta: Tensor) -> Tensor:
         """Build (N, P_total) parameter tensor — vectorized, no Python loops.
@@ -291,28 +292,39 @@ class QMLModel:
         # Build base params once — (N, P_total) on GPU
         base = self._build_param_batch(X, theta)
 
-        # ── Auto-tune params_per_chunk (TREV pattern) ─────────────────
-        # Probe with actual workload: alloc (2C, N, P_total) + measure
-        if not hasattr(self, '_ps_chunk') or self._ps_chunk is None:
-            from .optimization.auto_batch import auto_batch_size as _abs
+        # ── Auto-tune params_per_chunk, adapting to current N ────────
+        # Memory ∝ C × N, so the safe chunk size depends on N.
+        # Cache per-N and scale for unseen N values.
+        if not hasattr(self, '_ps_chunk_cache'):
+            self._ps_chunk_cache: dict[int, int] = {}
 
-            def _probe(C):
-                C = min(C, P)
-                if C < 1:
-                    return
-                blk = base.unsqueeze(0).expand(2 * C, -1, -1).clone()
-                for j in range(C):
-                    blk[2*j, :, self._train_idx[j]] += shift
-                    blk[2*j+1, :, self._train_idx[j]] -= shift
-                blk = blk.reshape(2 * C * N, -1)
-                self._measure_all_qubits(blk)
+        if N not in self._ps_chunk_cache:
+            if self._ps_chunk_cache:
+                # Scale from nearest known N (memory ∝ C × N)
+                ref_N = min(self._ps_chunk_cache, key=lambda k: abs(k - N))
+                ref_C = self._ps_chunk_cache[ref_N]
+                self._ps_chunk_cache[N] = max(1, min(P, int(ref_C * ref_N / N)))
+            else:
+                # First call ever — probe GPU
+                from .optimization.auto_batch import auto_batch_size as _abs
 
-            self._ps_chunk = _abs(
-                _probe, dev, min_bs=1, max_bs=P,
-                safety_frac=0.85, warmup=1,
-            )
+                def _probe(C):
+                    C = min(C, P)
+                    if C < 1:
+                        return
+                    blk = base.unsqueeze(0).expand(2 * C, -1, -1).clone()
+                    for j in range(C):
+                        blk[2*j, :, self._train_idx[j]] += shift
+                        blk[2*j+1, :, self._train_idx[j]] -= shift
+                    blk = blk.reshape(2 * C * N, -1)
+                    self._measure_all_qubits(blk)
 
-        chunk_size = self._ps_chunk
+                self._ps_chunk_cache[N] = _abs(
+                    _probe, dev, min_bs=1, max_bs=P,
+                    safety_frac=0.85, warmup=1,
+                )
+
+        chunk_size = self._ps_chunk_cache[N]
 
         # ── Compute gradients in chunks ───────────────────────────────
         grad = torch.zeros(self.n_qubits, P, N, dtype=torch.float64, device=dev)
@@ -332,6 +344,8 @@ class QMLModel:
             grad[:, start:stop, :] = (evs[:, :, 0, :] - evs[:, :, 1, :]) / denom
 
             del blk, evs
+            if dev.type == "cuda":
+                torch.cuda.empty_cache()
 
         return grad
 
@@ -352,6 +366,11 @@ class QMLModel:
         N = X.shape[0]
 
         mega = self._build_mega_batch(X, pop_thetas)
+
+        # Auto-tune if batch_size not set and on GPU
+        if self.batch_size is None and torch.device(self.device).type == "cuda":
+            self.auto_tune(ps * N)
+
         all_evs = self._measure_all_qubits(mega)  # (Q, ps*N)
         return all_evs.view(self.n_qubits, ps, N)
     
