@@ -112,29 +112,17 @@ class QMLModel:
             return
 
         # Step 1: find max batch_size for _measure_all_qubits
+        # Use _measure_all_qubits itself as the probe to capture exact memory
+        # (including the (Q, B, chi^4) intermediate tensor).
         dummy = torch.zeros(1, self._total_slots, dtype=torch.float32, device=dev)
+        old_bs = self.batch_size
 
         def _probe_bs(bs):
             p = dummy.expand(bs, -1).contiguous()
-            state = TensorRingState(self.n_qubits, self.rank, self.device, self.dtype)
-            bt = state.build_batch(self._gate_templates, p)
-            # Simulate the fused all-qubit measurement contraction
-            Q = self.n_qubits
-            Z_op = torch.tensor([[1, 0], [0, -1]], dtype=self.dtype, device=dev)
-            I_op = torch.eye(2, dtype=self.dtype, device=dev)
-            A = bt[:, 0]
-            AO_I = torch.einsum('blrd,dk->blrk', A, I_op)
-            E_I = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_I)
-            ten = E_I.unsqueeze(0).expand(Q, -1, -1, -1, -1, -1).clone()
-            for i in range(1, Q):
-                A = bt[:, i]
-                AO_I = torch.einsum('blrd,dk->blrk', A, I_op)
-                Ei = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_I)
-                Ei_all = Ei.unsqueeze(0).expand(Q, -1, -1, -1, -1, -1).clone()
-                ten = torch.einsum('Qbijpq,Qbpqrs->Qbijrs', ten, Ei_all)
-            torch.einsum('Qbijij->Qb', ten)
+            self.batch_size = bs  # no internal chunking during probe
+            self._measure_all_qubits(p)
 
-        max_total = N * self.n_trainable * 2  # upper bound for param-shift
+        max_total = N * self.n_trainable * 2
         self.batch_size = _abs(
             _probe_bs, dev, min_bs=N, max_bs=max(max_total, N),
             safety_frac=0.85, warmup=1,
