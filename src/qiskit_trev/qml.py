@@ -88,6 +88,69 @@ class QMLModel:
     def n_data(self) -> int:
         return len(self._data_indices)
 
+    def auto_tune(self, N: int) -> None:
+        """Auto-tune batch sizes for QML workloads.
+
+        QML has a 2D batching problem: data samples × parameter shifts.
+        This method probes GPU memory to find:
+          1. batch_size — max samples per _measure_all_qubits call
+          2. _ps_chunk  — max parameter shifts per gradient call,
+                          computed as batch_size // (2 * N)
+
+        Call once after construction with the training set size:
+            model.auto_tune(len(X_train))
+
+        Args:
+            N: Number of data samples (training set size).
+        """
+        from .optimization.auto_batch import auto_batch_size as _abs
+
+        dev = torch.device(self.device)
+        if dev.type != "cuda":
+            self.batch_size = N
+            self._ps_chunk = self.n_trainable
+            return
+
+        # Step 1: find max batch_size for _measure_all_qubits
+        dummy = torch.zeros(1, self._total_slots, dtype=torch.float32, device=dev)
+
+        def _probe_bs(bs):
+            p = dummy.expand(bs, -1).contiguous()
+            state = TensorRingState(self.n_qubits, self.rank, self.device, self.dtype)
+            bt = state.build_batch(self._gate_templates, p)
+            # Simulate the fused all-qubit measurement contraction
+            Q = self.n_qubits
+            Z_op = torch.tensor([[1, 0], [0, -1]], dtype=self.dtype, device=dev)
+            I_op = torch.eye(2, dtype=self.dtype, device=dev)
+            A = bt[:, 0]
+            AO_I = torch.einsum('blrd,dk->blrk', A, I_op)
+            E_I = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_I)
+            ten = E_I.unsqueeze(0).expand(Q, -1, -1, -1, -1, -1).clone()
+            for i in range(1, Q):
+                A = bt[:, i]
+                AO_I = torch.einsum('blrd,dk->blrk', A, I_op)
+                Ei = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_I)
+                Ei_all = Ei.unsqueeze(0).expand(Q, -1, -1, -1, -1, -1).clone()
+                ten = torch.einsum('Qbijpq,Qbpqrs->Qbijrs', ten, Ei_all)
+            torch.einsum('Qbijij->Qb', ten)
+
+        max_total = N * self.n_trainable * 2  # upper bound for param-shift
+        self.batch_size = _abs(
+            _probe_bs, dev, min_bs=N, max_bs=max(max_total, N),
+            safety_frac=0.85, warmup=1,
+        )
+
+        # Step 2: derive _ps_chunk from batch_size
+        # Each param-shift chunk processes 2 * chunk * N samples.
+        # Max chunk = batch_size // (2 * N), clamped to [1, n_trainable].
+        self._ps_chunk = max(1, min(self.batch_size // (2 * N), self.n_trainable))
+
+        n_chunks = math.ceil(self.n_trainable / self._ps_chunk)
+        print(f"QMLModel.auto_tune(N={N}):")
+        print(f"  batch_size = {self.batch_size:,} samples")
+        print(f"  _ps_chunk  = {self._ps_chunk} params/chunk "
+              f"({self._ps_chunk * 2 * N:,} evals/chunk, {n_chunks} chunks/epoch)")
+
     def _build_param_batch(self, X: Tensor, theta: Tensor) -> Tensor:
         """Build (N, P_total) parameter tensor — vectorized, no Python loops.
 
