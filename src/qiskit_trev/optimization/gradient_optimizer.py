@@ -23,6 +23,7 @@ class GradientOptimizer(Optimizer):
         optimizer_cls: "adam" or "sgd". Default "sgd".
         shift: Parameter shift amount for gradient computation.
         chunk_size: Batch chunk size for gradient computation.
+            Use "auto" to auto-tune on GPU.
     """
 
     def __init__(
@@ -30,7 +31,7 @@ class GradientOptimizer(Optimizer):
         lr: float = 0.01,
         optimizer_cls: str = "sgd",
         shift: float = math.pi / 2,
-        chunk_size: int | None = None,
+        chunk_size: int | str | None = None,
     ):
         self._lr = lr
         self._optimizer_cls = optimizer_cls.lower()

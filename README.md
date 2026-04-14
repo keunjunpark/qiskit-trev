@@ -49,6 +49,7 @@ See the [`tutorials/`](tutorials/) directory for Jupyter notebooks:
 1. **[Getting Started](tutorials/01_getting_started.ipynb)** — Circuits, sampling, and the TREV backend
 2. **[Expectation Values](tutorials/02_expectation_values.ipynb)** — Hamiltonians, estimator, and measurement methods
 3. **[VQE Optimization](tutorials/03_vqe_optimization.ipynb)** — Gradient descent and CMA-ES for variational algorithms
+4. **[Auto Batch Size](tutorials/04_auto_batch_size.ipynb)** — GPU memory-aware batch size tuning for parameter-shift gradients
 
 ## Architecture
 
