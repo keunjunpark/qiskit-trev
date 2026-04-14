@@ -117,3 +117,39 @@ class TestArgmaxBitstring:
         ])
         bs = argmax_bitstring(tensor)
         assert bs == "1"
+
+
+class TestArgmaxBitstringEdgeCases:
+
+    def test_normalize_every_triggers(self):
+        """normalize_every=1 triggers normalization at every step (lines 64-65)."""
+        tensor = _build_state(4, 4, [
+            GateInstruction("X", (0,)),
+            GateInstruction("X", (2,)),
+        ])
+        # normalize_every=1 normalizes at i=1,2,3,...
+        bs = argmax_bitstring(tensor, normalize_every=1)
+        assert bs == "1010"
+
+    def test_normalize_every_matches_default(self):
+        """Result with normalize_every=1 matches default behavior."""
+        tensor = _build_state(3, 4, [
+            GateInstruction("H", (0,)),
+            GateInstruction("CNOT", (0, 1)),
+            GateInstruction("CNOT", (1, 2)),
+        ])
+        bs_default = argmax_bitstring(tensor)
+        bs_norm = argmax_bitstring(tensor, normalize_every=1)
+        assert bs_norm == bs_default
+
+    def test_zero_probability_fallback(self):
+        """When both w0 and w1 clamp to 0, site defaults to 0 (line 56)."""
+        # Manually craft a tensor ring with all-zero first core so that
+        # both E_i0 and E_i1 are zero, causing trace to be 0 → clamp to 0.
+        tensor = _build_state(2, 4, [])
+        # Zero out the first site's core so both probability branches give 0
+        tensor = tensor.clone()
+        tensor[0] = 0.0
+        bs = argmax_bitstring(tensor)
+        # Should default to '0' for the zeroed site
+        assert bs[0] == "0"

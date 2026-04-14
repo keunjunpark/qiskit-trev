@@ -8,7 +8,8 @@ from qiskit.circuit import QuantumCircuit, Parameter
 from qiskit.quantum_info import SparsePauliOp
 from qiskit.primitives import StatevectorEstimator
 
-from qiskit_trev.estimator import TREVEstimator
+from qiskit_trev.estimator import TREVEstimator, _observables_to_sparse_pauli_op
+from qiskit_trev.tensor_ring.state import GateInstruction
 
 
 class TestBasicEstimation:
@@ -125,3 +126,113 @@ class TestMatchesStatevectorEstimator:
         ref = StatevectorEstimator().run([(qc, op, [0.7])]).result()[0].data.evs
         trev = TREVEstimator(rank=1).run([(qc, op, [0.7])]).result()[0].data.evs
         np.testing.assert_allclose(trev, ref, atol=1e-4)
+
+
+class TestObservablesToSparsePauliOp:
+
+    def test_passthrough_sparse_pauli_op(self):
+        """SparsePauliOp input should be returned as-is (line 27)."""
+        op = SparsePauliOp.from_list([("ZZ", 1.0)])
+        result = _observables_to_sparse_pauli_op(op)
+        assert result is op
+
+    def test_dict_input(self):
+        """Dict input should be converted to SparsePauliOp (line 29)."""
+        result = _observables_to_sparse_pauli_op({"ZI": 0.5, "IZ": -0.3})
+        assert isinstance(result, SparsePauliOp)
+        pauli_list = result.to_list()
+        labels = [p for p, _ in pauli_list]
+        assert "ZI" in labels
+        assert "IZ" in labels
+
+    def test_unsupported_type_raises(self):
+        """Unsupported type should raise TypeError (line 30)."""
+        with pytest.raises(TypeError, match="Unsupported observable type"):
+            _observables_to_sparse_pauli_op([("ZZ", 1.0)])
+
+
+class TestNonZIHamiltonian:
+
+    def test_x_hamiltonian(self):
+        """X Hamiltonian (non-ZI) uses ev_full path (line 104)."""
+        qc = QuantumCircuit(1)
+        qc.h(0)
+        op = SparsePauliOp.from_list([("X", 1.0)])
+        est = TREVEstimator(rank=1)
+        result = est.run([(qc, op)]).result()
+        # <+|X|+> = 1.0
+        np.testing.assert_allclose(result[0].data.evs, 1.0, atol=1e-4)
+
+    def test_y_hamiltonian(self):
+        """Y Hamiltonian (non-ZI) uses ev_full path."""
+        qc = QuantumCircuit(1)
+        qc.h(0)
+        qc.rz(math.pi / 2, 0)
+        op = SparsePauliOp.from_list([("Y", 1.0)])
+        ref = StatevectorEstimator().run([(qc, op)]).result()[0].data.evs
+        est = TREVEstimator(rank=1)
+        result = est.run([(qc, op)]).result()
+        np.testing.assert_allclose(result[0].data.evs, ref, atol=1e-4)
+
+    def test_xy_multi_term(self):
+        """Multi-term XY Hamiltonian uses ev_full."""
+        qc = QuantumCircuit(2)
+        qc.h(0)
+        qc.h(1)
+        op = SparsePauliOp.from_list([("XX", 1.0), ("YY", -0.5)])
+        ref = StatevectorEstimator().run([(qc, op)]).result()[0].data.evs
+        trev = TREVEstimator(rank=4).run([(qc, op)]).result()[0].data.evs
+        np.testing.assert_allclose(trev, ref, atol=1e-4)
+
+
+class TestZeroDimParams:
+
+    def test_no_parameter_circuit_runs(self):
+        """No-parameter circuit should work (ndim==0 branch, line 79)."""
+        qc = QuantumCircuit(1)
+        qc.x(0)
+        op = SparsePauliOp.from_list([("Z", 1.0)])
+        est = TREVEstimator(rank=1)
+        # Pass without parameter values → produces 0-dim params array
+        result = est.run([(qc, op)]).result()
+        np.testing.assert_allclose(result[0].data.evs, -1.0, atol=1e-5)
+
+
+class TestBindParams:
+
+    def test_bind_params_fixed_gates(self):
+        """_bind_params with no-param gate templates returns same gates."""
+        est = TREVEstimator(rank=1)
+        templates = [
+            GateInstruction("H", (0,)),
+            GateInstruction("X", (1,)),
+        ]
+        result = est._bind_params(templates, [])
+        assert len(result) == 2
+        assert result[0].name == "H"
+        assert result[1].name == "X"
+
+    def test_bind_params_parameterized_gates(self):
+        """_bind_params substitutes parameter values into templates."""
+        est = TREVEstimator(rank=1)
+        templates = [
+            GateInstruction("RY", (0,), params=(0.0,)),
+            GateInstruction("RX", (1,), params=(0.0,)),
+        ]
+        result = est._bind_params(templates, [1.5, 2.5])
+        assert len(result) == 2
+        assert result[0].params == (1.5,)
+        assert result[1].params == (2.5,)
+
+    def test_bind_params_insufficient_values(self):
+        """_bind_params falls back to original params when values run out."""
+        est = TREVEstimator(rank=1)
+        templates = [
+            GateInstruction("RY", (0,), params=(0.7,)),
+            GateInstruction("RY", (1,), params=(0.3,)),
+        ]
+        # Only provide enough values for first gate
+        result = est._bind_params(templates, [1.5])
+        assert result[0].params == (1.5,)
+        # Second gate falls back to original params
+        assert result[1].params == (0.3,)

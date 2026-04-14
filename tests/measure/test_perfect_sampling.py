@@ -144,3 +144,25 @@ class TestExpectationValue:
         h = Hamiltonian.from_pauli_list([("ZII", 1.0)])
         ev = expectation_value(tensor, h, shots=50000)
         assert abs(ev - math.cos(0.5)) < 0.05
+
+
+class TestZeroProbabilityEdgeCase:
+
+    def test_total_zero_probability_fallback(self):
+        """When total probability is 0, falls back to 50/50 (lines 67-68)."""
+        from qiskit_trev.measure.perfect_sampling import measure
+
+        # Build a normal 2-qubit state
+        state = TensorRingState(num_qubits=2, rank=4)
+        tensor = state.build([
+            GateInstruction("H", (0,)),
+            GateInstruction("CNOT", (0, 1)),
+        ])
+
+        # Zero out one site so that both qubit_0 and qubit_1 projections are 0
+        tensor_modified = tensor.clone()
+        tensor_modified[0] = 0.0
+
+        # Should not raise despite zero probability - returns a prob_dist list of length 2^N
+        prob_dist = measure(tensor_modified, shots=10)
+        assert len(prob_dist) == 4  # 2^2 = 4 states

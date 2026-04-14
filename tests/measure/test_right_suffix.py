@@ -147,3 +147,25 @@ class TestMatchesFullContraction:
         ev = expectation_value(tensor, h, shots=100000)
         ev_ref = full_contraction_ev(tensor, h)
         assert abs(ev - ev_ref) < 0.1
+
+
+class TestSeedParameter:
+
+    def test_seed_produces_consistent_results(self):
+        """Using seed=42 should hit gen.manual_seed(seed) (line 113)."""
+        from qiskit_trev.measure.right_suffix import expectation_value
+        from qiskit_trev.hamiltonian import Hamiltonian
+
+        state = TensorRingState(num_qubits=2, rank=4)
+        gates = [
+            GateInstruction("H", (0,)),
+            GateInstruction("CNOT", (0, 1)),
+        ]
+        tensor = state.build(gates)
+        hamiltonian = Hamiltonian.from_pauli_list([("ZI", 1.0), ("IZ", 1.0)])
+
+        # Use seed to trigger gen.manual_seed branch
+        ev1 = expectation_value(tensor, hamiltonian, shots=1000, seed=42)
+        ev2 = expectation_value(tensor, hamiltonian, shots=1000, seed=42)
+        # Same seed should give same result
+        assert ev1 == ev2

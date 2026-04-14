@@ -258,3 +258,79 @@ class TestEndToEndWorkflow:
 
         costs = ((logits.permute(0, 2, 1) - y.unsqueeze(0)) ** 2).mean(dim=(1, 2))
         assert costs.shape == (pop_size,)
+
+
+class TestPredict:
+
+    def test_predict_shape(self):
+        """predict() returns numpy array of class labels (lines 360-361)."""
+        n_qubits = 2
+        N = 6
+        C = 3
+        qc, di, ti = _make_circuit(n_qubits=n_qubits)
+        model = QMLModel(qc, di, ti, rank=4, device="cpu")
+
+        X = torch.randn(N, n_qubits)
+        theta = torch.randn(len(ti))
+        W = torch.randn(C, n_qubits, dtype=torch.float64)
+        b = torch.zeros(C, dtype=torch.float64)
+
+        labels = model.predict(X, theta, W, b)
+        assert labels.shape == (N,)
+        assert all(0 <= l < C for l in labels)
+
+    def test_predict_returns_numpy(self):
+        """predict() returns a numpy array, not a tensor."""
+        import numpy as np
+        qc, di, ti = _make_circuit(n_qubits=2)
+        model = QMLModel(qc, di, ti, rank=4, device="cpu")
+        X = torch.randn(4, 2)
+        theta = torch.randn(len(ti))
+        W = torch.randn(2, 2, dtype=torch.float64)
+        b = torch.zeros(2, dtype=torch.float64)
+        labels = model.predict(X, theta, W, b)
+        assert isinstance(labels, np.ndarray)
+
+
+class TestAutoTuneCPU:
+
+    def test_auto_tune_cpu_sets_batch_size(self):
+        """auto_tune on CPU sets batch_size = N and _ps_chunk = n_trainable (lines 109-112)."""
+        n_qubits = 2
+        N = 10
+        qc, di, ti = _make_circuit(n_qubits=n_qubits)
+        model = QMLModel(qc, di, ti, rank=4, device="cpu")
+        model.auto_tune(N)
+        assert model.batch_size == N
+        assert model._ps_chunk == len(ti)
+
+    def test_auto_tune_cpu_does_not_change_forward(self):
+        """auto_tune on CPU doesn't affect forward() results."""
+        n_qubits = 2
+        N = 5
+        qc, di, ti = _make_circuit(n_qubits=n_qubits)
+        model = QMLModel(qc, di, ti, rank=4, device="cpu")
+
+        X = torch.randn(N, n_qubits)
+        theta = torch.randn(len(ti))
+        evs_before = model(X, theta).clone()
+        model.auto_tune(N)
+        evs_after = model(X, theta)
+        torch.testing.assert_close(evs_before, evs_after, atol=1e-5, rtol=1e-5)
+
+
+class TestParameterShiftGradPresetChunk:
+
+    def test_grad_with_preset_ps_chunk(self):
+        """parameter_shift_grad with pre-set _ps_chunk bypasses auto-tuning (lines 296-313)."""
+        n_qubits = 2
+        N = 3
+        qc, di, ti = _make_circuit(n_qubits=n_qubits)
+        model = QMLModel(qc, di, ti, rank=4, device="cpu")
+        # Pre-set _ps_chunk to bypass the auto_batch_size probe
+        model._ps_chunk = len(ti)
+
+        X = torch.randn(N, n_qubits)
+        theta = torch.randn(len(ti))
+        grad = model.parameter_shift_grad(X, theta)
+        assert grad.shape == (n_qubits, len(ti), N)
