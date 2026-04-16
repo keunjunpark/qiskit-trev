@@ -222,7 +222,12 @@ class QMLModel:
             ten = E_I.unsqueeze(0).expand(Q, -1, -1, -1, -1, -1).clone()
             ten[0] = E_Z
 
-            # Contract remaining sites
+            # Contract remaining sites. Instead of broadcasting Ei_I across Q
+            # and overwriting slot i with Ei_Z (which materializes the full
+            # Q-expanded tensor via expand+clone each step), contract the full
+            # Q-wide `ten` against `Ei_I` via broadcast, then overwrite slot i
+            # with a 1/Q-sized einsum against `Ei_Z`. Eliminates the per-site
+            # clone and cuts the main einsum's read bandwidth by Q.
             for i in range(1, Q):
                 A = bt[:, i]
                 AO_I = torch.einsum('blrd,dk->blrk', A, I_op)
@@ -230,10 +235,9 @@ class QMLModel:
                 Ei_I = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_I)
                 Ei_Z = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_Z)
 
-                Ei_all = Ei_I.unsqueeze(0).expand(Q, -1, -1, -1, -1, -1).clone()
-                Ei_all[i] = Ei_Z
-
-                ten = torch.einsum('Qbijpq,Qbpqrs->Qbijrs', ten, Ei_all)
+                ten_i_prev = ten[i]
+                ten = torch.einsum('Qbijpq,bpqrs->Qbijrs', ten, Ei_I)
+                ten[i] = torch.einsum('bijpq,bpqrs->bijrs', ten_i_prev, Ei_Z)
 
             # Close ring: trace over (i=r, j=s)
             evs[:, start:stop] = torch.einsum('Qbijij->Qb', ten).real
