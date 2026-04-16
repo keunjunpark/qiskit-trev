@@ -333,23 +333,28 @@ class QMLModel:
         # ── Compute gradients in chunks ───────────────────────────────
         grad = torch.zeros(self.n_qubits, P, N, dtype=torch.float64, device=dev)
 
+        # Vectorized shift-add: build a sparse (2C, P_total) offset tensor that's
+        # +shift at slot train_idx[p] for row 2c, and -shift at the same slot for
+        # row 2c+1; zero elsewhere. Broadcast-add onto base to produce the (2C,
+        # N, P_total) param batch in one fused op instead of clone + per-param
+        # Python scatter.
+        rows_C = torch.arange(chunk_size, device=dev)
+
         for start in range(0, P, chunk_size):
             stop = min(start + chunk_size, P)
             C = stop - start
 
-            blk = base.unsqueeze(0).expand(2 * C, -1, -1).clone()
-            for j, p in enumerate(range(start, stop)):
-                blk[2*j, :, self._train_idx[p]] += shift
-                blk[2*j+1, :, self._train_idx[p]] -= shift
+            chunk_idx = self._train_idx[start:stop]
+            shift_add = torch.zeros(C, 2, base.shape[1], dtype=base.dtype, device=dev)
+            rows = rows_C[:C]
+            shift_add[rows, 0, chunk_idx] = shift
+            shift_add[rows, 1, chunk_idx] = -shift
+            shift_add = shift_add.view(2 * C, -1)
 
-            blk = blk.reshape(2 * C * N, -1)
+            blk = (base.unsqueeze(0) + shift_add.unsqueeze(1)).reshape(2 * C * N, -1)
             evs = self._measure_all_qubits(blk)
             evs = evs.view(self.n_qubits, C, 2, N)
             grad[:, start:stop, :] = (evs[:, :, 0, :] - evs[:, :, 1, :]) / denom
-
-            del blk, evs
-            if dev.type == "cuda":
-                torch.cuda.empty_cache()
 
         return grad
 
