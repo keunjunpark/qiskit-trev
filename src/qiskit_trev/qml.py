@@ -200,9 +200,6 @@ class QMLModel:
 
         evs = torch.zeros(Q, B, dtype=torch.float64, device=dev)
 
-        Z_op = torch.tensor([[1, 0], [0, -1]], dtype=self.dtype, device=dev)
-        I_op = torch.eye(2, dtype=self.dtype, device=dev)
-
         for start in range(0, B, bs):
             stop = min(start + bs, B)
             chunk = params_batch[start:stop]
@@ -211,12 +208,16 @@ class QMLModel:
             state = TensorRingState(Q, self.rank, self.device, self.dtype)
             bt = state.build_batch(self._gate_templates, chunk)
 
-            # Site 0: compute E_I and E_Z transfer matrices
+            # Transfer matrices for I and Z observables at site 0. Two
+            # algebraic simplifications vs a naive `einsum(A.conj(), Z@A)`:
+            # (1) AO_I = I @ A = A, so the I-branch skips the multiply and
+            # uses A directly. (2) Z = diag(1, -1) = I - 2|1><1|, so
+            # E_Z = E_I - 2 * (A.conj[...,1] ⊗ A[...,1]) — the correction is
+            # half the flops of the original 2-component E_Z einsum.
             A = bt[:, 0]  # (Bc, chi, chi, 2)
-            AO_I = torch.einsum('blrd,dk->blrk', A, I_op)
-            AO_Z = torch.einsum('blrd,dk->blrk', A, Z_op)
-            E_I = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_I)
-            E_Z = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_Z)
+            E_I = torch.einsum('blrd,bLRd->blLrR', A.conj(), A)
+            corr = torch.einsum('blr,bLR->blLrR', A.conj()[..., 1], A[..., 1])
+            E_Z = E_I - 2 * corr
 
             # ten[q] = E_Z if q==0, else E_I
             ten = E_I.unsqueeze(0).expand(Q, -1, -1, -1, -1, -1).clone()
@@ -230,10 +231,9 @@ class QMLModel:
             # clone and cuts the main einsum's read bandwidth by Q.
             for i in range(1, Q):
                 A = bt[:, i]
-                AO_I = torch.einsum('blrd,dk->blrk', A, I_op)
-                AO_Z = torch.einsum('blrd,dk->blrk', A, Z_op)
-                Ei_I = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_I)
-                Ei_Z = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_Z)
+                Ei_I = torch.einsum('blrd,bLRd->blLrR', A.conj(), A)
+                corr = torch.einsum('blr,bLR->blLrR', A.conj()[..., 1], A[..., 1])
+                Ei_Z = Ei_I - 2 * corr
 
                 ten_i_prev = ten[i]
                 ten = torch.einsum('Qbijpq,bpqrs->Qbijrs', ten, Ei_I)
