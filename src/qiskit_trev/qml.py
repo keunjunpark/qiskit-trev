@@ -200,9 +200,6 @@ class QMLModel:
 
         evs = torch.zeros(Q, B, dtype=torch.float64, device=dev)
 
-        Z_op = torch.tensor([[1, 0], [0, -1]], dtype=self.dtype, device=dev)
-        I_op = torch.eye(2, dtype=self.dtype, device=dev)
-
         for start in range(0, B, bs):
             stop = min(start + bs, B)
             chunk = params_batch[start:stop]
@@ -211,29 +208,36 @@ class QMLModel:
             state = TensorRingState(Q, self.rank, self.device, self.dtype)
             bt = state.build_batch(self._gate_templates, chunk)
 
-            # Site 0: compute E_I and E_Z transfer matrices
+            # Transfer matrices for I and Z observables at site 0. Two
+            # algebraic simplifications vs a naive `einsum(A.conj(), Z@A)`:
+            # (1) AO_I = I @ A = A, so the I-branch skips the multiply and
+            # uses A directly. (2) Z = diag(1, -1) = I - 2|1><1|, so
+            # E_Z = E_I - 2 * (A.conj[...,1] ⊗ A[...,1]) — the correction is
+            # half the flops of the original 2-component E_Z einsum.
             A = bt[:, 0]  # (Bc, chi, chi, 2)
-            AO_I = torch.einsum('blrd,dk->blrk', A, I_op)
-            AO_Z = torch.einsum('blrd,dk->blrk', A, Z_op)
-            E_I = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_I)
-            E_Z = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_Z)
+            E_I = torch.einsum('blrd,bLRd->blLrR', A.conj(), A)
+            corr = torch.einsum('blr,bLR->blLrR', A.conj()[..., 1], A[..., 1])
+            E_Z = E_I - 2 * corr
 
             # ten[q] = E_Z if q==0, else E_I
             ten = E_I.unsqueeze(0).expand(Q, -1, -1, -1, -1, -1).clone()
             ten[0] = E_Z
 
-            # Contract remaining sites
+            # Contract remaining sites. Instead of broadcasting Ei_I across Q
+            # and overwriting slot i with Ei_Z (which materializes the full
+            # Q-expanded tensor via expand+clone each step), contract the full
+            # Q-wide `ten` against `Ei_I` via broadcast, then overwrite slot i
+            # with a 1/Q-sized einsum against `Ei_Z`. Eliminates the per-site
+            # clone and cuts the main einsum's read bandwidth by Q.
             for i in range(1, Q):
                 A = bt[:, i]
-                AO_I = torch.einsum('blrd,dk->blrk', A, I_op)
-                AO_Z = torch.einsum('blrd,dk->blrk', A, Z_op)
-                Ei_I = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_I)
-                Ei_Z = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_Z)
+                Ei_I = torch.einsum('blrd,bLRd->blLrR', A.conj(), A)
+                corr = torch.einsum('blr,bLR->blLrR', A.conj()[..., 1], A[..., 1])
+                Ei_Z = Ei_I - 2 * corr
 
-                Ei_all = Ei_I.unsqueeze(0).expand(Q, -1, -1, -1, -1, -1).clone()
-                Ei_all[i] = Ei_Z
-
-                ten = torch.einsum('Qbijpq,Qbpqrs->Qbijrs', ten, Ei_all)
+                ten_i_prev = ten[i]
+                ten = torch.einsum('Qbijpq,bpqrs->Qbijrs', ten, Ei_I)
+                ten[i] = torch.einsum('bijpq,bpqrs->bijrs', ten_i_prev, Ei_Z)
 
             # Close ring: trace over (i=r, j=s)
             evs[:, start:stop] = torch.einsum('Qbijij->Qb', ten).real
@@ -329,23 +333,28 @@ class QMLModel:
         # ── Compute gradients in chunks ───────────────────────────────
         grad = torch.zeros(self.n_qubits, P, N, dtype=torch.float64, device=dev)
 
+        # Vectorized shift-add: build a sparse (2C, P_total) offset tensor that's
+        # +shift at slot train_idx[p] for row 2c, and -shift at the same slot for
+        # row 2c+1; zero elsewhere. Broadcast-add onto base to produce the (2C,
+        # N, P_total) param batch in one fused op instead of clone + per-param
+        # Python scatter.
+        rows_C = torch.arange(chunk_size, device=dev)
+
         for start in range(0, P, chunk_size):
             stop = min(start + chunk_size, P)
             C = stop - start
 
-            blk = base.unsqueeze(0).expand(2 * C, -1, -1).clone()
-            for j, p in enumerate(range(start, stop)):
-                blk[2*j, :, self._train_idx[p]] += shift
-                blk[2*j+1, :, self._train_idx[p]] -= shift
+            chunk_idx = self._train_idx[start:stop]
+            shift_add = torch.zeros(C, 2, base.shape[1], dtype=base.dtype, device=dev)
+            rows = rows_C[:C]
+            shift_add[rows, 0, chunk_idx] = shift
+            shift_add[rows, 1, chunk_idx] = -shift
+            shift_add = shift_add.view(2 * C, -1)
 
-            blk = blk.reshape(2 * C * N, -1)
+            blk = (base.unsqueeze(0) + shift_add.unsqueeze(1)).reshape(2 * C * N, -1)
             evs = self._measure_all_qubits(blk)
             evs = evs.view(self.n_qubits, C, 2, N)
             grad[:, start:stop, :] = (evs[:, :, 0, :] - evs[:, :, 1, :]) / denom
-
-            del blk, evs
-            if dev.type == "cuda":
-                torch.cuda.empty_cache()
 
         return grad
 
