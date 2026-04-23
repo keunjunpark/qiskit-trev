@@ -79,14 +79,36 @@ def _compile_fused_ops(gates: list["GateInstruction"]):
     return ops
 
 
-def _coalesce_2q_runs(ops: list, N: int) -> list:
-    """Coalesce consecutive fixed-matrix, non-wrap, q0<q1 2q gates of same name.
+_COALESCE_FIXED_NAMES = ("CNOT", "SWAP")
+_COALESCE_PARAM_NAMES = ("ZZ", "ZZ_SWAP")
 
-    These runs (e.g. a CNOT chain on adjacent pairs before the ring-wrap)
-    can be applied via jax.lax.fori_loop with one compiled body instead of
-    one unrolled HLO subgraph per gate. Parameterised gates and ring-wrap
-    gates fall through to single-gate application.
+
+def _coalesce_2q_runs(ops: list, N: int) -> list:
+    """Coalesce consecutive same-name, non-wrap, q0<q1 adjacent 2q gates.
+
+    Two classes are recognised:
+
+    - **Fixed-matrix** (``CNOT``, ``SWAP``): run shares one 4×4 matrix, so
+      the fori_loop body does not need to index per-gate matrices.
+    - **Parameterised** (``ZZ``, ``ZZ_SWAP``): each gate has its own θ,
+      so matrices are stacked into ``(num_gates, B, 4, 4)`` and the body
+      indexes into the stack. Enables QAOA and Trotter workloads to hit
+      the fori_loop fast path instead of unrolling every gate.
+
+    Parameterised same-name run items carry the full ``GateInstruction``
+    (to read ``param_indices`` at apply time). Fixed-matrix run items
+    carry just ``(q0, q1)`` tuples.
     """
+    def _eligible(instr):
+        if instr.params and instr.name in _COALESCE_PARAM_NAMES:
+            return "param"
+        if (not instr.params) and instr.name in _COALESCE_FIXED_NAMES:
+            return "fixed"
+        return None
+
+    def _can_coalesce_pair(q0, q1):
+        return not (q0 >= q1 or (q0 == 0 and q1 == N - 1) or q1 - q0 != 1)
+
     out: list = []
     i = 0
     while i < len(ops):
@@ -96,32 +118,34 @@ def _coalesce_2q_runs(ops: list, N: int) -> list:
             i += 1
             continue
         instr = op[1]
-        if instr.params or instr.name not in ("CNOT", "SWAP"):
+        kind = _eligible(instr)
+        if kind is None:
             out.append(op)
             i += 1
             continue
         q0, q1 = instr.qubits
-        # Non-wrap, q0 < q1, adjacent only. Ring-wrap and reversed pairs
-        # keep the single-gate path (cheap, rare).
-        if q0 >= q1 or (q0 == 0 and q1 == N - 1) or q1 - q0 != 1:
+        if not _can_coalesce_pair(q0, q1):
             out.append(op)
             i += 1
             continue
 
-        run_pairs = [(q0, q1)]
+        run_items: list = [(q0, q1) if kind == "fixed" else instr]
         j = i + 1
         while j < len(ops) and ops[j][0] == "2q":
             nxt = ops[j][1]
-            if nxt.name != instr.name or nxt.params:
+            if nxt.name != instr.name:
+                break
+            if _eligible(nxt) != kind:
                 break
             nq0, nq1 = nxt.qubits
-            if nq0 >= nq1 or (nq0 == 0 and nq1 == N - 1) or nq1 - nq0 != 1:
+            if not _can_coalesce_pair(nq0, nq1):
                 break
-            run_pairs.append((nq0, nq1))
+            run_items.append((nq0, nq1) if kind == "fixed" else nxt)
             j += 1
 
-        if len(run_pairs) >= 2:
-            out.append(("2q_run_fixed", instr.name, run_pairs))
+        if len(run_items) >= 2:
+            tag = "2q_run_fixed" if kind == "fixed" else "2q_run_param"
+            out.append((tag, instr.name, run_items))
             i = j
         else:
             out.append(op)
@@ -258,6 +282,12 @@ def build_batch_jax(
             tensor = _apply_2q_run_fori(
                 tensor, fixed_mat, run_pairs, rank, precision=precision
             )
+        elif op_type == "2q_run_param":
+            _, gate_name, run_instrs = item
+            tensor = _apply_2q_run_param_fori(
+                tensor, gate_name, run_instrs, params_batch, B, rank,
+                precision=precision,
+            )
         else:  # '2q' single gate
             instr = item[1]
             q0, q1 = instr.qubits
@@ -272,6 +302,58 @@ def build_batch_jax(
             )
 
     return tensor
+
+
+def _apply_2q_run_param_fori(
+    tensor: jnp.ndarray,
+    gate_name: str,
+    run_instrs: list,
+    params_batch: jnp.ndarray,
+    B: int,
+    rank: int,
+    *,
+    precision: jax.lax.Precision,
+) -> jnp.ndarray:
+    """Apply a run of parameterised 2q gates (ZZ / ZZ_SWAP) via fori_loop.
+
+    Each gate has its own θ, so we gather all thetas into a ``(num_gates,
+    B)`` array, build the stacked matrix ``(num_gates, B, 4, 4)`` in ONE
+    matrix-construction call (ZZ/ZZ_SWAP are elementwise on θ), and iterate
+    over qubit pairs inside ``fori_loop`` — so the SVD body compiles once
+    for the whole run.
+    """
+    num_gates = len(run_instrs)
+    # Gather per-gate θ: each run_instrs[k].param_indices[0] points into
+    # params_batch along axis 1. Stack to (num_gates, B).
+    param_idx_list = [instr.param_indices[0] for instr in run_instrs]
+    thetas = params_batch[:, jnp.asarray(param_idx_list)].T  # (num_gates, B)
+
+    # One matrix-construction call covers the whole run — ZZ/ZZ_SWAP are
+    # pure elementwise on θ so a flat (num_gates*B,) input is fine.
+    thetas_flat = thetas.reshape(-1)
+    builder = _GATE_MAP_2Q_PARAM[gate_name]
+    mats_flat = builder(thetas_flat)  # (num_gates * B, 4, 4)
+    mats = mats_flat.reshape(num_gates, B, 4, 4)
+
+    pair_arr = jnp.asarray(
+        [(instr.qubits[0], instr.qubits[1]) for instr in run_instrs],
+        dtype=jnp.int32,
+    )
+
+    def body(i, tensor):
+        q0 = pair_arr[i, 0]
+        q1 = pair_arr[i, 1]
+        matrix = mats[i]
+        core_a = jnp.take(tensor, q0, axis=1)
+        core_b = jnp.take(tensor, q1, axis=1)
+        new_a, new_b = apply_double_qubit_gate_batch_jax(
+            matrix, core_a, core_b, max_rank=rank, precision=precision
+        )
+        tensor = jax.lax.dynamic_update_index_in_dim(tensor, new_a, q0, axis=1)
+        tensor = jax.lax.dynamic_update_index_in_dim(tensor, new_b, q1, axis=1)
+        return tensor
+
+    return jax.lax.fori_loop(0, num_gates, body, tensor)
 
 
 def _apply_2q_run_fori(
