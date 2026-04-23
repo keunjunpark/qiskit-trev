@@ -12,6 +12,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from ..backend import Backend, get_backend
 from ..hamiltonian import Hamiltonian
 
 
@@ -108,59 +109,80 @@ def batched_expectation_value(
     Returns:
         (B,) tensor of real expectation values.
     """
+    backend = get_backend(batch_tensor)
+    device = batch_tensor.device
+
+    paulis = backend.to_device(hamiltonian.get_bool_pauli_tensor(), device)  # (T, N)
+    coeffs = backend.as_tensor(hamiltonian.coefficients, device=device)
+
+    return _batched_expectation_kernel(
+        backend, batch_tensor, paulis, coeffs, chunk_size
+    )
+
+
+def _batched_expectation_kernel(
+    backend: Backend,
+    batch_tensor,
+    paulis,
+    coeffs,
+    chunk_size: int | None,
+):
+    """Backend-agnostic kernel for batched <psi|H|psi>.
+
+    Pulled out of :func:`batched_expectation_value` so the same body can be
+    wrapped by backend-specific JIT compilers (``jax.jit``) in later steps.
+    """
     device = batch_tensor.device
     B = batch_tensor.shape[0]
     N = batch_tensor.shape[1]
-
-    paulis = hamiltonian.get_bool_pauli_tensor().to(device)  # (T, N)
     T = paulis.shape[0]
 
-    coeffs = torch.as_tensor(
-        hamiltonian.coefficients, dtype=torch.cfloat, device=device
-    )
-
-    Z_op = torch.tensor([[1, 0], [0, -1]], dtype=torch.cfloat, device=device)
-    I_op = torch.eye(2, dtype=torch.cfloat, device=device)
+    Z_op = backend.tensor([[1, 0], [0, -1]], device=device)
+    I_op = backend.eye(2, device=device)
 
     if chunk_size is None:
         chunk_size = T
 
-    total = torch.zeros(B, dtype=torch.cfloat, device=device)
+    total = backend.zeros(B, device=device)
 
     for start in range(0, T, chunk_size):
         stop = min(start + chunk_size, T)
         mask = paulis[start:stop]      # (C, N)
         coefs = coeffs[start:stop]     # (C,)
-        C = mask.size(0)
+        C = mask.shape[0]
 
         # Build first site's batched transfer matrices
         A = batch_tensor[:, 0]  # (B, chi_L, chi_R, 2)
-        AO_I = torch.einsum('blrd,dk->blrk', A, I_op)
-        AO_Z = torch.einsum('blrd,dk->blrk', A, Z_op)
-        E_I = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_I)  # (B, chi, chi, chi, chi)
-        E_Z = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_Z)
+        AO_I = backend.einsum('blrd,dk->blrk', A, I_op)
+        AO_Z = backend.einsum('blrd,dk->blrk', A, Z_op)
+        E_I = backend.einsum('blrd,bLRd->blLrR', A.conj(), AO_I)  # (B, chi, chi, chi, chi)
+        E_Z = backend.einsum('blrd,bLRd->blLrR', A.conj(), AO_Z)
 
         # Select E_Z or E_I per Hamiltonian term: (C, B, chi, chi, chi, chi)
-        m0 = mask[:, 0].view(C, 1, 1, 1, 1, 1)
-        ten = torch.where(m0, E_Z.unsqueeze(0), E_I.unsqueeze(0))  # (C, B, l, l', r, r')
+        m0 = backend.reshape(mask[:, 0], (C, 1, 1, 1, 1, 1))
+        ten = backend.where(
+            m0, backend.unsqueeze(E_Z, 0), backend.unsqueeze(E_I, 0)
+        )  # (C, B, l, l', r, r')
 
         # Contract remaining sites
         for i in range(1, N):
             A = batch_tensor[:, i]
-            AO_I = torch.einsum('blrd,dk->blrk', A, I_op)
-            AO_Z = torch.einsum('blrd,dk->blrk', A, Z_op)
-            Ei_I = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_I)
-            Ei_Z = torch.einsum('blrd,bLRd->blLrR', A.conj(), AO_Z)
+            AO_I = backend.einsum('blrd,dk->blrk', A, I_op)
+            AO_Z = backend.einsum('blrd,dk->blrk', A, Z_op)
+            Ei_I = backend.einsum('blrd,bLRd->blLrR', A.conj(), AO_I)
+            Ei_Z = backend.einsum('blrd,bLRd->blLrR', A.conj(), AO_Z)
 
-            mi = mask[:, i].view(C, 1, 1, 1, 1, 1)
-            Ei = torch.where(mi, Ei_Z.unsqueeze(0), Ei_I.unsqueeze(0))  # (C, B, l, l', r, r')
+            mi = backend.reshape(mask[:, i], (C, 1, 1, 1, 1, 1))
+            Ei = backend.where(
+                mi, backend.unsqueeze(Ei_Z, 0), backend.unsqueeze(Ei_I, 0)
+            )  # (C, B, l, l', r, r')
 
             # Contract: ten(c,b,i,j,p,q) @ Ei(c,b,p,q,r,s) → (c,b,i,j,r,s)
-            ten = torch.einsum('cbijpq,cbpqrs->cbijrs', ten, Ei)
+            ten = backend.einsum('cbijpq,cbpqrs->cbijrs', ten, Ei)
 
         # Close ring: trace over (i=r, j=s)
-        vals = torch.einsum('cbijij->cb', ten)  # (C, B)
+        vals = backend.einsum('cbijij->cb', ten)  # (C, B)
         # Sum weighted terms: coefs(C) * vals(C, B) → (B,)
-        total = total + torch.einsum('c,cb->b', coefs, vals)
+        total = total + backend.einsum('c,cb->b', coefs, vals)
 
     return total.real
