@@ -153,9 +153,14 @@ def main():
     has_cuda = torch.cuda.is_available()
     device = "cuda" if has_cuda else "cpu"
 
-    # Sweep: fix N=6, reps=1, C=5, vary rank (χ). Also a depth sweep at rank=8.
+    # Three sweeps to isolate what drives compile:
+    #   chi_sweep   — varies bond dim (the Track-B research knob)
+    #   depth_sweep — varies circuit reps (conflates depth + parameter count)
+    #   N_sweep     — varies qubit count at fixed reps=1 (isolates "more qubits"
+    #                 from "deeper circuit")
     chi_sweep = [(6, 1, chi, 5) for chi in [6, 8, 12, 16, 24, 32]]
     depth_sweep = [(6, r, 8, 5) for r in [1, 2, 3]]
+    N_sweep = [(N, 1, 8, 5) for N in [4, 6, 8, 10, 12]]
 
     print(f"device = {device}")
     print(
@@ -185,6 +190,13 @@ def main():
             row(profile_grad_kernel(N, reps, rank, C, device))
         except Exception as e:
             print(f"skip reps={reps}: {type(e).__name__}: {str(e)[:160]}")
+
+    print(f"\n--- N sweep (reps=1, rank=8, C=5) ---")
+    for N, reps, rank, C in N_sweep:
+        try:
+            row(profile_grad_kernel(N, reps, rank, C, device))
+        except Exception as e:
+            print(f"skip N={N}: {type(e).__name__}: {str(e)[:160]}")
 
 
 if __name__ == "__main__":
