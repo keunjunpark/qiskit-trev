@@ -37,6 +37,17 @@ dev = [
 ci = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    # CI runs on CPU — install CPU-only jax so the JAX backend's tests
+    # and coverage are included in the run.
+    "jax>=0.4.25",
+]
+# Optional JAX backend: 2-9x faster gradient on GPU after warm-up.
+# See tutorials/05_jax_backend.md for when and how to use it.
+jax = [
+    "jax>=0.4.25",
+]
+jax-cuda = [
+    "jax[cuda12]>=0.4.25",
 ]
 
 [project.urls]

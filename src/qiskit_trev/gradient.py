@@ -14,7 +14,9 @@ from torch import Tensor
 
 from .model import TensorRingModel
 from .tensor_ring.state import TensorRingState
-from .measure.efficient_contraction import expectation_value as ev_efficient
+from .measure.efficient_contraction import (
+    batched_expectation_value as batched_ev_efficient,
+)
 from .measure.full_contraction import expectation_value as ev_full
 
 
@@ -71,11 +73,13 @@ def _gpu_worker(
         )
         batch_tensor = state.build_batch(model._gate_templates, batch)
 
-        evs = torch.zeros(2 * C, dtype=torch.float64)
-        for i in range(2 * C):
-            if model._use_efficient:
-                evs[i] = ev_efficient(batch_tensor[i], model._hamiltonian)
-            else:
+        if model._use_efficient:
+            evs = batched_ev_efficient(batch_tensor, model._hamiltonian).to(
+                torch.float64
+            )
+        else:
+            evs = torch.zeros(2 * C, dtype=torch.float64)
+            for i in range(2 * C):
                 evs[i] = ev_full(batch_tensor[i], model._hamiltonian)
 
         grad_shared[start:stop] = 0.5 * (evs[:C] - evs[C:]) / math.sin(shift)
@@ -83,16 +87,60 @@ def _gpu_worker(
         torch.cuda.empty_cache()
 
 
+_VALID_BACKENDS = ("auto", "torch", "jax")
+
+
+def _resolve_backend_pref(backend_arg: str | None) -> str:
+    """Resolve the backend preference for a gradient call.
+
+    Precedence: explicit constructor arg > ``QISKIT_TREV_BACKEND`` env
+    var > ``"auto"``. The env var is read on each gradient call (cheap,
+    and lets notebooks override without rebuilding objects).
+    """
+    import os
+    import warnings
+
+    if backend_arg is not None:
+        if backend_arg not in _VALID_BACKENDS:
+            raise ValueError(
+                f"backend must be one of {_VALID_BACKENDS}, got {backend_arg!r}"
+            )
+        return backend_arg
+    env = os.environ.get("QISKIT_TREV_BACKEND", "auto").lower()
+    if env not in _VALID_BACKENDS:
+        warnings.warn(
+            f"QISKIT_TREV_BACKEND={env!r} not in {_VALID_BACKENDS}; "
+            "falling back to 'auto'",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return "auto"
+    return env
+
+
 class BatchParameterShiftGradient:
     """Compute parameter-shift gradients using batched tensor ring evaluation.
 
-    Supports auto batch size tuning and multi-GPU distribution.
+    Supports auto batch size tuning, multi-GPU distribution, and optional
+    JAX-backend acceleration.
 
     Args:
         model: TensorRingModel to compute gradients for.
         shift: Parameter shift amount (default pi/2).
         chunk_size: Params per chunk. None = all at once. "auto" = auto-tune on GPU.
         num_gpus: Number of GPUs to use. None = auto-detect. 0 or 1 = single device.
+        backend: Force a compute backend.
+
+            - ``None`` (default): honour the ``QISKIT_TREV_BACKEND`` env var, or
+              ``"auto"`` if unset.
+            - ``"auto"``: dispatch based on the type of ``params`` at call time —
+              ``torch.Tensor`` runs the torch path, ``jax.Array`` runs the
+              JIT-compiled JAX path.
+            - ``"torch"``: always run the torch path, converting jax inputs
+              back if needed.
+            - ``"jax"``: always run the JIT-compiled JAX path, converting
+              torch inputs over. The return type matches the input type, so
+              drop-in use in torch training loops works unchanged.
     """
 
     def __init__(
@@ -101,12 +149,21 @@ class BatchParameterShiftGradient:
         shift: float = math.pi / 2,
         chunk_size: int | str | None = None,
         num_gpus: int | None = None,
+        backend: str | None = None,
     ):
         self._model = model
         self._shift = shift
         self._chunk_size_setting = chunk_size
         self._num_gpus = num_gpus
         self._resolved_chunk_size: int | None = None
+        # Validate the constructor arg early (the env-var case is validated
+        # on each call in _resolve_backend_pref so a user fixing the env var
+        # mid-session doesn't have to rebuild).
+        if backend is not None and backend not in _VALID_BACKENDS:
+            raise ValueError(
+                f"backend must be one of {_VALID_BACKENDS}, got {backend!r}"
+            )
+        self._backend_arg = backend
 
     def _resolve_chunk_size(self, P: int) -> int:
         """Resolve chunk_size, potentially using auto-tuning."""
@@ -145,28 +202,77 @@ class BatchParameterShiftGradient:
         return P
 
     @torch.no_grad()
-    def __call__(self, params: Tensor) -> Tensor:
+    def __call__(self, params):
         """Compute gradient via batched parameter shift.
 
+        The compute backend is selected by (in precedence order) the
+        ``backend=`` constructor arg, the ``QISKIT_TREV_BACKEND`` env var,
+        or the input type (``"auto"``). See the class docstring for
+        details. Return type always matches input type — drop-in in
+        torch training loops.
+
         Args:
-            params: (P,) tensor of parameter values.
+            params: (P,) array of parameter values (torch or jax).
 
         Returns:
-            (P,) tensor of gradients.
+            (P,) array of gradients, same backend as ``params``.
         """
-        P = len(params)
-        if P == 0:
-            return torch.zeros(0, dtype=torch.float64)
+        pref = _resolve_backend_pref(self._backend_arg)
 
-        # Determine multi-GPU vs single-device
-        num_gpus = self._num_gpus
-        if num_gpus is None:
-            num_gpus = _get_gpu_count()
+        input_module = type(params).__module__
+        is_jax_input = input_module.startswith("jax") or input_module.startswith("jaxlib")
 
-        if num_gpus > 1:
-            return self._compute_multi_gpu(params, num_gpus)
+        if pref == "auto":
+            use_jax = is_jax_input
         else:
-            return self._compute_single(params)
+            use_jax = pref == "jax"
+
+        # Convert input to the shape the chosen path expects.
+        if use_jax and not is_jax_input:
+            compute_params = self._to_jax(params)
+        elif not use_jax and is_jax_input:
+            compute_params = self._to_torch(params)
+        else:
+            compute_params = params
+
+        if use_jax:
+            result = self._compute_single_jax(compute_params)
+        else:
+            P = len(compute_params)
+            if P == 0:
+                result = torch.zeros(0, dtype=torch.float64)
+            else:
+                num_gpus = self._num_gpus
+                if num_gpus is None:
+                    num_gpus = _get_gpu_count()
+                if num_gpus > 1:
+                    result = self._compute_multi_gpu(compute_params, num_gpus)
+                else:
+                    result = self._compute_single(compute_params)
+
+        # Match output type to input type.
+        if use_jax and not is_jax_input:
+            return self._to_torch(result)
+        if not use_jax and is_jax_input:
+            return self._to_jax(result)
+        return result
+
+    @staticmethod
+    def _to_jax(x):
+        import jax.numpy as jnp
+
+        if hasattr(x, "detach"):  # torch.Tensor
+            return jnp.asarray(x.detach().cpu().numpy())
+        return jnp.asarray(x)
+
+    @staticmethod
+    def _to_torch(x):
+        import numpy as np
+
+        if hasattr(x, "detach"):  # already a torch tensor
+            return x
+        # Copy so torch.from_numpy doesn't alias jax's non-writable buffer.
+        return torch.from_numpy(np.asarray(x).copy())
 
     def _compute_single(self, params: Tensor) -> Tensor:
         """Single-device gradient computation."""
@@ -194,11 +300,13 @@ class BatchParameterShiftGradient:
             )
             batch_tensor = state.build_batch(model._gate_templates, base)
 
-            evs = torch.zeros(2 * C, dtype=torch.float64)
-            for i in range(2 * C):
-                if model._use_efficient:
-                    evs[i] = ev_efficient(batch_tensor[i], model._hamiltonian)
-                else:
+            if model._use_efficient:
+                evs = batched_ev_efficient(batch_tensor, model._hamiltonian).to(
+                    torch.float64
+                )
+            else:
+                evs = torch.zeros(2 * C, dtype=torch.float64)
+                for i in range(2 * C):
                     evs[i] = ev_full(batch_tensor[i], model._hamiltonian)
 
             grad[start:stop] = (evs[:C] - evs[C:]) / denom
@@ -230,3 +338,199 @@ class BatchParameterShiftGradient:
                 f.result()  # raises exceptions from workers
 
         return grad_shared.clone()
+
+    def _compute_single_jax(self, params):
+        """JIT-compiled JAX gradient path.
+
+        Fuses build_batch + batched expectation value + shift diff into one
+        XLA graph per (model, shift, P) combination. Per plan/14 Step 4 the
+        vmap-equivalent batching is expressed directly via the batch axis
+        of build_batch, which is simpler than wrapping in :func:`jax.vmap`
+        and compiles to the same program.
+
+        **First-call compile** is ~2–3 s on GPU, ~30–50 s on TPU. That cost
+        is paid once per ``(model, shift, P)`` key for the life of the
+        Python process. For iterative training it amortises after ~100–500
+        gradient steps; below that, the torch path is faster on wall time.
+        To collapse the compile cost across process restarts, enable JAX's
+        on-disk cache once per process via
+        :func:`qiskit_trev.backend.enable_compilation_cache`.
+        """
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+
+        from .backend import JAX_BACKEND
+        from .measure.efficient_contraction import _batched_expectation_kernel
+        from .tensor_ring._state_jax import build_batch_jax
+
+        P = int(params.shape[0])
+        if P == 0:
+            return jnp.zeros(0, dtype=jnp.float32)
+
+        model = self._model
+        shift = self._shift
+
+        cache = getattr(self, "_jax_jit_cache", None)
+        if cache is None:
+            cache = {}
+            self._jax_jit_cache = cache
+
+        # Respect the chunk_size knob so the JAX path shares OOM-handling
+        # discipline with the torch path. Current torch `auto` probes GPU
+        # memory with a torch kernel — the number is a conservative
+        # estimate for JAX (XLA usually allocates a bit more), but it's
+        # the right order of magnitude. If user sets chunk_size=None we
+        # keep the old "all at once" behaviour.
+        setting = self._chunk_size_setting
+        if isinstance(setting, int):
+            chunk_size = min(setting, P)
+        elif setting == "auto":
+            chunk_size = min(self._resolve_chunk_size(P), P)
+        else:
+            chunk_size = P
+
+        if chunk_size >= P:
+            return self._jax_grad_single_shot(params, P, cache).block_until_ready()
+
+        return self._jax_grad_chunked(params, P, chunk_size, cache).block_until_ready()
+
+    def _jax_grad_constants(self):
+        """Cache the per-model JAX constants (paulis, Z/I, coeffs).
+
+        Rebuilt lazily and reused across both single-shot and chunked
+        gradient paths so we don't pay the torch→jax conversion twice.
+        """
+        import jax.numpy as jnp
+        import numpy as np
+
+        cache = self._jax_jit_cache
+        key = ("constants", id(self._model))
+        if key in cache:
+            return cache[key]
+        ham = self._model._hamiltonian
+        paulis = jnp.asarray(ham.get_bool_pauli_tensor().numpy())
+        coeffs = jnp.asarray(
+            np.asarray(ham.coefficients, dtype=np.complex64)
+        )
+        Z_op = jnp.asarray([[1, 0], [0, -1]], dtype=jnp.complex64)
+        I_op = jnp.eye(2, dtype=jnp.complex64)
+        cache[key] = (paulis, coeffs, Z_op, I_op)
+        return cache[key]
+
+    def _jax_grad_single_shot(self, params, P: int, cache: dict):
+        """Original non-chunked kernel — kept as the fast path when P is
+        small enough that chunking would add overhead."""
+        import jax
+        import jax.numpy as jnp
+
+        from .backend import JAX_BACKEND
+        from .measure.efficient_contraction import _batched_expectation_kernel
+        from .tensor_ring._state_jax import build_batch_jax
+
+        model = self._model
+        shift = self._shift
+        cache_key = ("single", id(model), shift, P)
+        jit_fn = cache.get(cache_key)
+        if jit_fn is None:
+            paulis, coeffs, Z_op, I_op = self._jax_grad_constants()
+            num_qubits = model._num_qubits
+            rank = model.rank
+            gates = model._gate_templates
+            denom = 2.0 * math.sin(shift)
+
+            def _grad_fn(params_j):
+                eye = jnp.eye(P, dtype=params_j.dtype)
+                all_shifted = jnp.concatenate(
+                    [
+                        params_j[None] + shift * eye,
+                        params_j[None] - shift * eye,
+                    ],
+                    axis=0,
+                )
+                state = build_batch_jax(num_qubits, rank, gates, all_shifted)
+                total_init = jnp.zeros(2 * P, dtype=jnp.complex64)
+                evs = _batched_expectation_kernel(
+                    JAX_BACKEND, state, paulis, coeffs, Z_op, I_op,
+                    total_init, None,
+                )
+                return (evs[:P] - evs[P:]) / denom
+
+            jit_fn = jax.jit(_grad_fn)
+            cache[cache_key] = jit_fn
+        return jit_fn(params)
+
+    def _jax_grad_chunked(self, params, P: int, chunk_size: int, cache: dict):
+        """Chunked JAX gradient — applies at most ``2 * chunk_size``
+        shifted parameter vectors in a single JIT graph.
+
+        One compile per distinct chunk size: ``chunk_size`` for all full
+        chunks, plus one extra compile for the remainder if P isn't a
+        multiple of chunk_size.
+        """
+        import jax
+        import jax.numpy as jnp
+
+        from .backend import JAX_BACKEND
+        from .measure.efficient_contraction import _batched_expectation_kernel
+        from .tensor_ring._state_jax import build_batch_jax
+
+        model = self._model
+        shift = self._shift
+        paulis, coeffs, Z_op, I_op = self._jax_grad_constants()
+        num_qubits = model._num_qubits
+        rank = model.rank
+        gates = model._gate_templates
+        denom = 2.0 * math.sin(shift)
+
+        def _make_chunk_kernel(C: int, P_arg: int):
+            """JIT a kernel that shifts params at [start : start+C]."""
+            def _chunk_grad(params_j, start):
+                # rows selects which parameter index to shift for each of C
+                # shifted slots. `start` is traced — no recompile across
+                # different offsets.
+                rows = jnp.arange(C)
+                idx = start + rows  # (C,)
+                eye_cols = jnp.zeros((C, P_arg), dtype=params_j.dtype)
+                eye_cols = eye_cols.at[rows, idx].set(1.0)
+                shifted_plus = params_j[None] + shift * eye_cols
+                shifted_minus = params_j[None] - shift * eye_cols
+                all_shifted = jnp.concatenate(
+                    [shifted_plus, shifted_minus], axis=0
+                )
+                state = build_batch_jax(
+                    num_qubits, rank, gates, all_shifted
+                )
+                total_init = jnp.zeros(2 * C, dtype=jnp.complex64)
+                evs = _batched_expectation_kernel(
+                    JAX_BACKEND, state, paulis, coeffs, Z_op, I_op,
+                    total_init, None,
+                )
+                return (evs[:C] - evs[C:]) / denom
+            return jax.jit(_chunk_grad)
+
+        def _get_or_build(C: int):
+            key = ("chunk", id(model), shift, P, C)
+            fn = cache.get(key)
+            if fn is None:
+                fn = _make_chunk_kernel(C, P)
+                cache[key] = fn
+            return fn
+
+        full_chunks = P // chunk_size
+        remainder = P - full_chunks * chunk_size
+
+        result = jnp.zeros(P, dtype=jnp.float32)
+        full_fn = _get_or_build(chunk_size) if full_chunks else None
+        for i in range(full_chunks):
+            start = i * chunk_size
+            chunk_grad = full_fn(params, start)
+            result = result.at[start:start + chunk_size].set(chunk_grad)
+
+        if remainder:
+            remainder_fn = _get_or_build(remainder)
+            start = full_chunks * chunk_size
+            chunk_grad = remainder_fn(params, start)
+            result = result.at[start:].set(chunk_grad)
+
+        return result

@@ -20,6 +20,7 @@ from qiskit.circuit import QuantumCircuit
 from qiskit.quantum_info import SparsePauliOp
 
 from .converter import circuit_to_gate_instructions, sparse_pauli_op_to_hamiltonian
+from .gradient import _resolve_backend_pref, _VALID_BACKENDS
 from .tensor_ring.state import TensorRingState
 from .hamiltonian import Hamiltonian
 from .measure.efficient_contraction import batched_expectation_value
@@ -36,6 +37,16 @@ class QMLModel:
         device: "cpu" or "cuda".
         dtype: Complex dtype for tensor ring.
         batch_size: Chunk size for batched evaluation. None = all at once.
+        backend: Force a compute backend.
+
+            - ``None`` (default): honour ``QISKIT_TREV_BACKEND`` env var, or
+              ``"auto"`` if unset.
+            - ``"auto"``: dispatch by ``theta`` type — torch → torch path,
+              jax.Array → jitted JAX path.
+            - ``"torch"``: always torch.
+            - ``"jax"``: always the JIT JAX path. Torch inputs are
+              converted to jax for compute; outputs are converted back to
+              torch so the return type still matches the input type.
     """
 
     def __init__(
@@ -47,6 +58,7 @@ class QMLModel:
         device: str = "cpu",
         dtype: torch.dtype = torch.cfloat,
         batch_size: int | None = None,
+        backend: str | None = None,
     ):
         self.n_qubits = circuit.num_qubits
         self.rank = rank
@@ -70,6 +82,13 @@ class QMLModel:
 
         self._data_indices = data_indices
         self._trainable_indices = trainable_indices
+
+        if backend is not None and backend not in _VALID_BACKENDS:
+            raise ValueError(
+                f"backend must be one of {_VALID_BACKENDS}, got {backend!r}"
+            )
+        self._backend_arg = backend
+        self._jax_jit_cache: dict = {}
 
         # Per-qubit Z Hamiltonians
         # Qiskit little-endian: qubit q = position q from the right
@@ -267,11 +286,26 @@ class QMLModel:
         Returns:
             (n_qubits, N) tensor on device.
         """
+        use_jax, theta_is_jax = self._decide_jax(theta)
+        if use_jax:
+            return self._forward_jax(X, theta, theta_is_jax=theta_is_jax)
         params = self._build_param_batch(X, theta)
         return self._measure_all_qubits(params)
 
     @torch.no_grad()
     def parameter_shift_grad(
+        self, X: Tensor, theta: Tensor, shift: float = math.pi / 2
+    ) -> Tensor:
+        """See below. JAX path dispatch inserted at the top."""
+        use_jax, theta_is_jax = self._decide_jax(theta)
+        if use_jax:
+            return self._parameter_shift_grad_jax(
+                X, theta, shift=shift, theta_is_jax=theta_is_jax
+            )
+        return self._parameter_shift_grad_torch(X, theta, shift=shift)
+
+    @torch.no_grad()
+    def _parameter_shift_grad_torch(
         self, X: Tensor, theta: Tensor, shift: float = math.pi / 2
     ) -> Tensor:
         """Compute d<Z_q>/dtheta_i for all qubits, params, and data points.
@@ -360,6 +394,16 @@ class QMLModel:
 
     @torch.no_grad()
     def forward_population(self, X: Tensor, pop_thetas: Tensor) -> Tensor:
+        """See below. JAX path dispatch inserted at the top."""
+        use_jax, theta_is_jax = self._decide_jax(pop_thetas)
+        if use_jax:
+            return self._forward_population_jax(
+                X, pop_thetas, theta_is_jax=theta_is_jax
+            )
+        return self._forward_population_torch(X, pop_thetas)
+
+    @torch.no_grad()
+    def _forward_population_torch(self, X: Tensor, pop_thetas: Tensor) -> Tensor:
         """Forward pass for a population of theta vectors.
 
         Mega-batches all candidates x all data points.
@@ -387,3 +431,176 @@ class QMLModel:
         """Class predictions (numpy). Convenience for evaluation."""
         evs = self.forward(X, theta)
         return torch.tanh(W.to(self.device) @ evs + b.to(self.device).unsqueeze(1)).argmax(0).cpu().numpy()
+
+    # ----- JAX path ---------------------------------------------------
+
+    def _decide_jax(self, probe) -> tuple[bool, bool]:
+        """(use_jax, probe_is_jax). `probe` is theta / pop_thetas."""
+        pref = _resolve_backend_pref(self._backend_arg)
+        mod = type(probe).__module__
+        probe_is_jax = mod.startswith("jax") or mod.startswith("jaxlib")
+        if pref == "auto":
+            return probe_is_jax, probe_is_jax
+        return pref == "jax", probe_is_jax
+
+    @staticmethod
+    def _to_jax(x):
+        import jax.numpy as jnp
+
+        if hasattr(x, "detach"):  # torch.Tensor
+            return jnp.asarray(x.detach().cpu().numpy())
+        return jnp.asarray(x)
+
+    @staticmethod
+    def _to_torch(x, device: str):
+        import numpy as np
+
+        if hasattr(x, "detach"):
+            return x.to(device)
+        return torch.from_numpy(np.asarray(x).copy()).to(device)
+
+    def _jax_index_arrays(self):
+        """Return (data_idx, feat_idx, train_idx) as jnp.int32 arrays."""
+        import jax.numpy as jnp
+
+        cache = getattr(self, "_jax_index_cache", None)
+        if cache is not None:
+            return cache
+        data_idx = jnp.asarray(self._data_indices, dtype=jnp.int32)
+        feat_idx = jnp.asarray(
+            [i % self.n_qubits for i in range(len(self._data_indices))],
+            dtype=jnp.int32,
+        )
+        train_idx = jnp.asarray(self._trainable_indices, dtype=jnp.int32)
+        self._jax_index_cache = (data_idx, feat_idx, train_idx)
+        return self._jax_index_cache
+
+    def _forward_jax(self, X, theta, *, theta_is_jax: bool):
+        import jax
+        import jax.numpy as jnp
+
+        from ._qml_jax import measure_all_qubits_jax, build_param_batch_jax
+
+        X_j = self._to_jax(X)
+        theta_j = theta if theta_is_jax else self._to_jax(theta)
+        data_idx, feat_idx, train_idx = self._jax_index_arrays()
+
+        N = int(X_j.shape[0])
+        chunk = self.batch_size if self.batch_size is not None else N
+        chunk = max(1, min(chunk, N))
+
+        if chunk >= N:
+            # Fast path — single jit covers the whole batch.
+            cache_key = ("forward", X_j.shape, theta_j.shape[0])
+            jit_fn = self._jax_jit_cache.get(cache_key)
+            if jit_fn is None:
+                def _fn(X_arg, theta_arg):
+                    p = build_param_batch_jax(
+                        X_arg, theta_arg, self._total_slots,
+                        data_idx, feat_idx, train_idx,
+                    )
+                    return measure_all_qubits_jax(
+                        self.n_qubits, self.rank, self._gate_templates, p
+                    )
+                jit_fn = jax.jit(_fn)
+                self._jax_jit_cache[cache_key] = jit_fn
+            result = jit_fn(X_j, theta_j)
+        else:
+            # Chunked path — one jit per unique chunk size (usually just
+            # one compile for the full chunk, plus one for the remainder).
+            # Batch dim lives in X only; params_batch grows with it, so
+            # chunking X is enough to cap live memory.
+            def _fn_sized(C: int):
+                def _body(X_arg, theta_arg):
+                    p = build_param_batch_jax(
+                        X_arg, theta_arg, self._total_slots,
+                        data_idx, feat_idx, train_idx,
+                    )
+                    return measure_all_qubits_jax(
+                        self.n_qubits, self.rank, self._gate_templates, p
+                    )
+                return jax.jit(_body)
+
+            def _get_or_build(C: int):
+                key = ("forward_chunk", C, X_j.shape[1], theta_j.shape[0])
+                fn = self._jax_jit_cache.get(key)
+                if fn is None:
+                    fn = _fn_sized(C)
+                    self._jax_jit_cache[key] = fn
+                return fn
+
+            pieces = []
+            for start in range(0, N, chunk):
+                stop = min(start + chunk, N)
+                C = stop - start
+                fn = _get_or_build(C)
+                pieces.append(fn(X_j[start:stop], theta_j))
+            result = jnp.concatenate(pieces, axis=1)  # (Q, N)
+
+        if theta_is_jax:
+            return result  # caller is in JAX land
+        import numpy as np
+        return torch.from_numpy(np.asarray(result).copy()).to(self.device).to(torch.float64)
+
+    def _parameter_shift_grad_jax(self, X, theta, *, shift, theta_is_jax):
+        import jax
+
+        from ._qml_jax import parameter_shift_grad_jax
+
+        X_j = self._to_jax(X)
+        theta_j = theta if theta_is_jax else self._to_jax(theta)
+        data_idx, feat_idx, train_idx = self._jax_index_arrays()
+
+        chunk_size = getattr(self, "_ps_chunk_cache", {}).get(X_j.shape[0])
+        if chunk_size is None:
+            chunk_size = self.n_trainable
+
+        cache_key = (
+            "param_shift", X_j.shape, theta_j.shape[0], shift, int(chunk_size)
+        )
+        jit_fn = self._jax_jit_cache.get(cache_key)
+        if jit_fn is None:
+            def _fn(X_arg, theta_arg):
+                return parameter_shift_grad_jax(
+                    self.n_qubits, self.rank, self._gate_templates,
+                    X_arg, theta_arg,
+                    self._total_slots, data_idx, feat_idx, train_idx,
+                    shift, chunk_size=chunk_size,
+                )
+
+            jit_fn = jax.jit(_fn)
+            self._jax_jit_cache[cache_key] = jit_fn
+
+        result = jit_fn(X_j, theta_j)
+        if theta_is_jax:
+            return result
+        import numpy as np
+        return torch.from_numpy(np.asarray(result).copy()).to(self.device).to(torch.float64)
+
+    def _forward_population_jax(self, X, pop_thetas, *, theta_is_jax):
+        import jax
+
+        from ._qml_jax import forward_population_jax
+
+        X_j = self._to_jax(X)
+        pt_j = pop_thetas if theta_is_jax else self._to_jax(pop_thetas)
+        data_idx, feat_idx, train_idx = self._jax_index_arrays()
+
+        cache_key = ("forward_pop", X_j.shape, pt_j.shape)
+        jit_fn = self._jax_jit_cache.get(cache_key)
+        if jit_fn is None:
+            def _fn(X_arg, pt_arg):
+                return forward_population_jax(
+                    self.n_qubits, self.rank, self._gate_templates,
+                    X_arg, pt_arg,
+                    self._total_slots, data_idx, feat_idx, train_idx,
+                )
+
+            jit_fn = jax.jit(_fn)
+            self._jax_jit_cache[cache_key] = jit_fn
+
+        result = jit_fn(X_j, pt_j)
+        if theta_is_jax:
+            return result
+        import numpy as np
+        return torch.from_numpy(np.asarray(result).copy()).to(self.device).to(torch.float64)
