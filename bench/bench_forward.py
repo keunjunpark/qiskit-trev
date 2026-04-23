@@ -102,9 +102,16 @@ def time_jax(N, chi, B, reps, ham, runs):
 
 def main():
     torch.set_num_threads(1)
-    runs = 10
+    has_cuda = torch.cuda.is_available()
+    runs = 10 if has_cuda else 3
 
-    for N, chi, B, reps, C in [(8, 8, 16, 2, 10), (10, 12, 16, 2, 20), (12, 12, 32, 2, 50)]:
+    # Drop the heaviest workload on non-CUDA hosts — torch-on-CPU at χ=12 is
+    # several seconds per iteration.
+    workloads = [(8, 8, 16, 2, 10), (10, 12, 16, 2, 20), (12, 12, 32, 2, 50)]
+    if not has_cuda:
+        workloads = workloads[:2]
+
+    for N, chi, B, reps, C in workloads:
         ham = _ham(N, C)
         print(f"\n=== N={N} chi={chi} B={B} reps={reps} C={C} ===")
         ts_t = time_torch(N, chi, B, reps, ham, runs)

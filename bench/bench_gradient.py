@@ -102,14 +102,20 @@ def fmt(ts):
 
 def main():
     torch.set_num_threads(1)
-    runs = 5
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    has_cuda = torch.cuda.is_available()
+    device = "cuda" if has_cuda else "cpu"
+    runs = 5 if has_cuda else 3
 
     workloads = [
         dict(N=6,  reps=1, rank=6,  C=10),
         dict(N=8,  reps=1, rank=8,  C=20),
         dict(N=10, reps=2, rank=10, C=50),
     ]
+    if not has_cuda:
+        # Drop the P=20 workload on CPU — torch at 100ms * 2P=40 shifts =
+        # several seconds per gradient call, and JAX-on-TPU is what we care
+        # about for Step 5.
+        workloads = workloads[:2]
 
     for w in workloads:
         N, reps, rank, C = w["N"], w["reps"], w["rank"], w["C"]

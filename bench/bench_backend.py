@@ -128,32 +128,38 @@ def fmt(ts: list[float]) -> str:
 
 def main():
     torch.set_num_threads(1)
-    runs = 20
+    # On non-CUDA hosts (CPU, TPU), torch runs on CPU and dominates wall time.
+    # Cut runs and skip the two extra-JAX paths kept for local precision study.
+    has_cuda = torch.cuda.is_available()
+    runs = 20 if has_cuda else 5
 
     for chi, N, C, B in [(12, 16, 100, 32), (8, 12, 50, 16)]:
         print(f"\n=== χ={chi} N={N} C={C} B={B} ===")
         batch, ham = build_workload(chi, N, C, B)
-        device_t = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device_t = torch.device("cuda" if has_cuda else "cpu")
         batch = batch.to(device_t)
 
         ts_torch = time_torch(batch, ham, runs)
         print(f"torch           : {fmt(ts_torch)}")
 
-        ts_jax_eager = time_jax_eager(batch, ham, runs)
-        print(f"jax eager DEF   : {fmt(ts_jax_eager)}")
-
         ts_jax_jit, compile_s = time_jax_jit(batch, ham, JAX_BACKEND, runs)
         print(f"jax jit   DEF   : {fmt(ts_jax_jit)}  "
               f"(first-call compile={compile_s*1e3:.1f} ms)")
 
-        ts_jax_high, compile_s_h = time_jax_jit(batch, ham, JAX_BACKEND_HIGHEST, runs)
-        print(f"jax jit   HIGH  : {fmt(ts_jax_high)}  "
-              f"(first-call compile={compile_s_h*1e3:.1f} ms)")
-
         ratio_def = statistics.median(ts_torch) / statistics.median(ts_jax_jit)
-        ratio_high = statistics.median(ts_torch) / statistics.median(ts_jax_high)
         print(f"→ torch/jax-jit (DEFAULT)  = {ratio_def:.2f}x")
-        print(f"→ torch/jax-jit (HIGHEST)  = {ratio_high:.2f}x")
+
+        if has_cuda:
+            ts_jax_eager = time_jax_eager(batch, ham, runs)
+            print(f"jax eager DEF   : {fmt(ts_jax_eager)}")
+
+            ts_jax_high, compile_s_h = time_jax_jit(
+                batch, ham, JAX_BACKEND_HIGHEST, runs
+            )
+            print(f"jax jit   HIGH  : {fmt(ts_jax_high)}  "
+                  f"(first-call compile={compile_s_h*1e3:.1f} ms)")
+            ratio_high = statistics.median(ts_torch) / statistics.median(ts_jax_high)
+            print(f"→ torch/jax-jit (HIGHEST)  = {ratio_high:.2f}x")
 
 
 if __name__ == "__main__":
