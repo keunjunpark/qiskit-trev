@@ -231,17 +231,31 @@ class TensorRingState:
             )
 
     def build_batch(
-        self, gates: list[GateInstruction], params_batch: Tensor
-    ) -> Tensor:
+        self, gates: list[GateInstruction], params_batch
+    ):
         """Build tensor ring states for a batch of parameter sets.
+
+        Dispatches on the type of ``params_batch`` — torch tensors run the
+        existing torch path, ``jax.Array`` inputs run the JAX path in
+        :mod:`._state_jax`. The JAX path returns a ``jax.Array`` that
+        :func:`batched_expectation_value` also dispatches on.
 
         Args:
             gates: Gate instruction templates (params are placeholders).
-            params_batch: (B, P) tensor of parameter values per batch element.
+            params_batch: ``(B, P)`` array (torch or JAX) of parameter values.
 
         Returns:
-            Tensor of shape (B, num_qubits, rank, rank, 2).
+            Array of shape ``(B, num_qubits, rank, rank, 2)`` in the same
+            backend as ``params_batch``.
         """
+        mod = type(params_batch).__module__
+        if mod.startswith("jax") or mod.startswith("jaxlib"):
+            from ._state_jax import build_batch_jax
+
+            return build_batch_jax(
+                self.num_qubits, self.rank, gates, params_batch
+            )
+
         B = params_batch.shape[0]
         N = self.num_qubits
         rank = self.rank
