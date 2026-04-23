@@ -114,6 +114,26 @@ from disk in under a second.
 JAX is not a hard dependency — the backend module imports it lazily, so
 torch-only installs keep working.
 
+### Choosing a backend
+
+By default `BatchParameterShiftGradient` dispatches by input type: pass
+a `torch.Tensor` and the torch path runs, pass a `jax.Array` and the
+JIT JAX path runs. To force one or the other:
+
+```python
+# Per-object:
+grad_fn = BatchParameterShiftGradient(model, backend="jax")
+grad_fn = BatchParameterShiftGradient(model, backend="torch")
+grad_fn = BatchParameterShiftGradient(model, backend="auto")   # default
+
+# Session-wide (env var):
+#   QISKIT_TREV_BACKEND=jax python train.py
+```
+
+With `backend="jax"` and torch-typed `params`, inputs are converted to
+JAX, the jit path runs, and the output is converted back to torch —
+drop-in in a torch training loop with no other changes.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit pull requests, report bugs, or suggest features.

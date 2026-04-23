@@ -87,16 +87,60 @@ def _gpu_worker(
         torch.cuda.empty_cache()
 
 
+_VALID_BACKENDS = ("auto", "torch", "jax")
+
+
+def _resolve_backend_pref(backend_arg: str | None) -> str:
+    """Resolve the backend preference for a gradient call.
+
+    Precedence: explicit constructor arg > ``QISKIT_TREV_BACKEND`` env
+    var > ``"auto"``. The env var is read on each gradient call (cheap,
+    and lets notebooks override without rebuilding objects).
+    """
+    import os
+    import warnings
+
+    if backend_arg is not None:
+        if backend_arg not in _VALID_BACKENDS:
+            raise ValueError(
+                f"backend must be one of {_VALID_BACKENDS}, got {backend_arg!r}"
+            )
+        return backend_arg
+    env = os.environ.get("QISKIT_TREV_BACKEND", "auto").lower()
+    if env not in _VALID_BACKENDS:
+        warnings.warn(
+            f"QISKIT_TREV_BACKEND={env!r} not in {_VALID_BACKENDS}; "
+            "falling back to 'auto'",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return "auto"
+    return env
+
+
 class BatchParameterShiftGradient:
     """Compute parameter-shift gradients using batched tensor ring evaluation.
 
-    Supports auto batch size tuning and multi-GPU distribution.
+    Supports auto batch size tuning, multi-GPU distribution, and optional
+    JAX-backend acceleration.
 
     Args:
         model: TensorRingModel to compute gradients for.
         shift: Parameter shift amount (default pi/2).
         chunk_size: Params per chunk. None = all at once. "auto" = auto-tune on GPU.
         num_gpus: Number of GPUs to use. None = auto-detect. 0 or 1 = single device.
+        backend: Force a compute backend.
+
+            - ``None`` (default): honour the ``QISKIT_TREV_BACKEND`` env var, or
+              ``"auto"`` if unset.
+            - ``"auto"``: dispatch based on the type of ``params`` at call time —
+              ``torch.Tensor`` runs the torch path, ``jax.Array`` runs the
+              JIT-compiled JAX path.
+            - ``"torch"``: always run the torch path, converting jax inputs
+              back if needed.
+            - ``"jax"``: always run the JIT-compiled JAX path, converting
+              torch inputs over. The return type matches the input type, so
+              drop-in use in torch training loops works unchanged.
     """
 
     def __init__(
@@ -105,12 +149,21 @@ class BatchParameterShiftGradient:
         shift: float = math.pi / 2,
         chunk_size: int | str | None = None,
         num_gpus: int | None = None,
+        backend: str | None = None,
     ):
         self._model = model
         self._shift = shift
         self._chunk_size_setting = chunk_size
         self._num_gpus = num_gpus
         self._resolved_chunk_size: int | None = None
+        # Validate the constructor arg early (the env-var case is validated
+        # on each call in _resolve_backend_pref so a user fixing the env var
+        # mid-session doesn't have to rebuild).
+        if backend is not None and backend not in _VALID_BACKENDS:
+            raise ValueError(
+                f"backend must be one of {_VALID_BACKENDS}, got {backend!r}"
+            )
+        self._backend_arg = backend
 
     def _resolve_chunk_size(self, P: int) -> int:
         """Resolve chunk_size, potentially using auto-tuning."""
@@ -152,33 +205,74 @@ class BatchParameterShiftGradient:
     def __call__(self, params):
         """Compute gradient via batched parameter shift.
 
-        Dispatches on ``type(params)`` — ``torch.Tensor`` keeps the torch
-        path (single- or multi-GPU); ``jax.Array`` runs a JIT-compiled JAX
-        path that fuses build_batch + batched expectation + shift diff.
+        The compute backend is selected by (in precedence order) the
+        ``backend=`` constructor arg, the ``QISKIT_TREV_BACKEND`` env var,
+        or the input type (``"auto"``). See the class docstring for
+        details. Return type always matches input type — drop-in in
+        torch training loops.
 
         Args:
-            params: (P,) array of parameter values.
+            params: (P,) array of parameter values (torch or jax).
 
         Returns:
-            (P,) array of gradients in the same backend as ``params``.
+            (P,) array of gradients, same backend as ``params``.
         """
-        mod = type(params).__module__
-        if mod.startswith("jax") or mod.startswith("jaxlib"):
-            return self._compute_single_jax(params)
+        pref = _resolve_backend_pref(self._backend_arg)
 
-        P = len(params)
-        if P == 0:
-            return torch.zeros(0, dtype=torch.float64)
+        input_module = type(params).__module__
+        is_jax_input = input_module.startswith("jax") or input_module.startswith("jaxlib")
 
-        # Determine multi-GPU vs single-device
-        num_gpus = self._num_gpus
-        if num_gpus is None:
-            num_gpus = _get_gpu_count()
-
-        if num_gpus > 1:
-            return self._compute_multi_gpu(params, num_gpus)
+        if pref == "auto":
+            use_jax = is_jax_input
         else:
-            return self._compute_single(params)
+            use_jax = pref == "jax"
+
+        # Convert input to the shape the chosen path expects.
+        if use_jax and not is_jax_input:
+            compute_params = self._to_jax(params)
+        elif not use_jax and is_jax_input:
+            compute_params = self._to_torch(params)
+        else:
+            compute_params = params
+
+        if use_jax:
+            result = self._compute_single_jax(compute_params)
+        else:
+            P = len(compute_params)
+            if P == 0:
+                result = torch.zeros(0, dtype=torch.float64)
+            else:
+                num_gpus = self._num_gpus
+                if num_gpus is None:
+                    num_gpus = _get_gpu_count()
+                if num_gpus > 1:
+                    result = self._compute_multi_gpu(compute_params, num_gpus)
+                else:
+                    result = self._compute_single(compute_params)
+
+        # Match output type to input type.
+        if use_jax and not is_jax_input:
+            return self._to_torch(result)
+        if not use_jax and is_jax_input:
+            return self._to_jax(result)
+        return result
+
+    @staticmethod
+    def _to_jax(x):
+        import jax.numpy as jnp
+
+        if hasattr(x, "detach"):  # torch.Tensor
+            return jnp.asarray(x.detach().cpu().numpy())
+        return jnp.asarray(x)
+
+    @staticmethod
+    def _to_torch(x):
+        import numpy as np
+
+        if hasattr(x, "detach"):  # already a torch tensor
+            return x
+        # Copy so torch.from_numpy doesn't alias jax's non-writable buffer.
+        return torch.from_numpy(np.asarray(x).copy())
 
     def _compute_single(self, params: Tensor) -> Tensor:
         """Single-device gradient computation."""
