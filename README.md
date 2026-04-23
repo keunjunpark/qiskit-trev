@@ -45,12 +45,13 @@ pip install -e ".[dev]"
 
 ## Tutorials
 
-See the [`tutorials/`](tutorials/) directory for Jupyter notebooks:
+See the [`tutorials/`](tutorials/) directory:
 
 1. **[Getting Started](tutorials/01_getting_started.ipynb)** — Circuits, sampling, and the TREV backend
 2. **[Expectation Values](tutorials/02_expectation_values.ipynb)** — Hamiltonians, estimator, and measurement methods
 3. **[VQE Optimization](tutorials/03_vqe_optimization.ipynb)** — Gradient descent and CMA-ES for variational algorithms
 4. **[Auto Batch Size](tutorials/04_auto_batch_size.ipynb)** — GPU memory-aware batch size tuning for parameter-shift gradients
+5. **[JAX backend](tutorials/05_jax_backend.md)** — Enable the JAX-JIT path for 2–9× GPU gradient speedup, persistent compile cache (including Colab Drive), backend toggle, and OOM mitigation
 
 ## Architecture
 
@@ -82,79 +83,6 @@ qiskit_trev/
 | **Gradients** | Parameter-shift rule | Parameter-shift rule |
 | **Ecosystem** | Standalone | Qiskit plugin |
 | **Install** | `pip install TREV` | `pip install qiskit-trev` |
-
-## Experimental JAX backend
-
-An optional JAX backend lives behind `qiskit_trev.backend`. It dispatches
-automatically on the input array type — pass a `jax.Array` to
-`batched_expectation_value`, `TensorRingState.build_batch`, or
-`BatchParameterShiftGradient(...).__call__` and the JAX path runs
-(jit-compiled end-to-end); pass a `torch.Tensor` and the existing
-PyTorch path runs unchanged.
-
-On a modern NVIDIA GPU the JAX gradient path is roughly 2–9× faster
-**per step** than the PyTorch path once warm. The first call pays an
-XLA compile cost (~1–3 s on GPU, ~30–50 s on TPU), so the wall-clock
-win only appears after ~100–500 iterations. **For shorter scripts or
-interactive development, enable the on-disk compilation cache so
-second-and-later Python processes skip compile entirely:**
-
-```python
-from qiskit_trev.backend import enable_compilation_cache
-
-enable_compilation_cache()  # writes to ~/.cache/qiskit_trev_jax
-```
-
-Pass a path explicitly if you want a different cache location. With
-the cache enabled, the first run of a given model/parameter-count still
-compiles normally; every subsequent Python process (notebook restart,
-repeated script, fresh pytest session) reloads the compiled artifact
-from disk in under a second.
-
-**On Colab, point the cache at Google Drive** — Colab VMs wipe local
-disk on every disconnect, so `~/.cache/...` doesn't actually persist
-between sessions:
-
-```python
-from google.colab import drive
-drive.mount('/content/drive')
-
-from qiskit_trev.backend import enable_compilation_cache
-enable_compilation_cache('/content/drive/MyDrive/qiskit_trev_cache')
-```
-
-With the Drive-mounted cache, long-running research survives VM
-disconnects — the compile artifact follows your notebook across
-sessions. First run still pays full compile; every session afterwards
-loads from Drive in ~1 s regardless of whether the Colab VM is new.
-
-The cache is invalidated automatically when JAX / XLA upgrade, when
-the target device model changes, or when the traced program changes
-(e.g. new gate in the circuit, different χ) — so stale artifacts
-never silently run.
-
-JAX is not a hard dependency — the backend module imports it lazily, so
-torch-only installs keep working.
-
-### Choosing a backend
-
-By default `BatchParameterShiftGradient` dispatches by input type: pass
-a `torch.Tensor` and the torch path runs, pass a `jax.Array` and the
-JIT JAX path runs. To force one or the other:
-
-```python
-# Per-object:
-grad_fn = BatchParameterShiftGradient(model, backend="jax")
-grad_fn = BatchParameterShiftGradient(model, backend="torch")
-grad_fn = BatchParameterShiftGradient(model, backend="auto")   # default
-
-# Session-wide (env var):
-#   QISKIT_TREV_BACKEND=jax python train.py
-```
-
-With `backend="jax"` and torch-typed `params`, inputs are converted to
-JAX, the jit path runs, and the output is converted back to torch —
-drop-in in a torch training loop with no other changes.
 
 ## Contributing
 
