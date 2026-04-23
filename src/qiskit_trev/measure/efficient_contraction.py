@@ -168,21 +168,26 @@ def _batched_expectation_kernel(
             m0, backend.unsqueeze(E_Z, 0), backend.unsqueeze(E_I, 0)
         )  # (C, B, l, l', r, r')
 
-        # Contract remaining sites
-        for i in range(1, N):
-            A = batch_tensor[:, i]
-            AO_I = backend.einsum('blrd,dk->blrk', A, I_op)
-            AO_Z = backend.einsum('blrd,dk->blrk', A, Z_op)
-            Ei_I = backend.einsum('blrd,bLRd->blLrR', A.conj(), AO_I)
-            Ei_Z = backend.einsum('blrd,bLRd->blLrR', A.conj(), AO_Z)
+        # Contract remaining sites. On JAX we fold the loop into jax.lax.scan
+        # so the site-body compiles once instead of unrolling N times.
+        # Python-loop path remains for torch (where scan doesn't apply).
+        if backend.name == "jax" and N > 1:
+            ten = _scan_sites_jax(backend, ten, batch_tensor, mask, Z_op, I_op)
+        else:
+            for i in range(1, N):
+                A = batch_tensor[:, i]
+                AO_I = backend.einsum('blrd,dk->blrk', A, I_op)
+                AO_Z = backend.einsum('blrd,dk->blrk', A, Z_op)
+                Ei_I = backend.einsum('blrd,bLRd->blLrR', A.conj(), AO_I)
+                Ei_Z = backend.einsum('blrd,bLRd->blLrR', A.conj(), AO_Z)
 
-            mi = backend.reshape(mask[:, i], (C, 1, 1, 1, 1, 1))
-            Ei = backend.where(
-                mi, backend.unsqueeze(Ei_Z, 0), backend.unsqueeze(Ei_I, 0)
-            )  # (C, B, l, l', r, r')
+                mi = backend.reshape(mask[:, i], (C, 1, 1, 1, 1, 1))
+                Ei = backend.where(
+                    mi, backend.unsqueeze(Ei_Z, 0), backend.unsqueeze(Ei_I, 0)
+                )  # (C, B, l, l', r, r')
 
-            # Contract: ten(c,b,i,j,p,q) @ Ei(c,b,p,q,r,s) → (c,b,i,j,r,s)
-            ten = backend.einsum('cbijpq,cbpqrs->cbijrs', ten, Ei)
+                # Contract: ten(c,b,i,j,p,q) @ Ei(c,b,p,q,r,s) → (c,b,i,j,r,s)
+                ten = backend.einsum('cbijpq,cbpqrs->cbijrs', ten, Ei)
 
         # Close ring: trace over (i=r, j=s)
         vals = backend.einsum('cbijij->cb', ten)  # (C, B)
@@ -190,3 +195,34 @@ def _batched_expectation_kernel(
         total = total + backend.einsum('c,cb->b', coefs, vals)
 
     return total.real
+
+
+def _scan_sites_jax(backend, ten_init, batch_tensor, mask, Z_op, I_op):
+    """jax.lax.scan over the site loop in _batched_expectation_kernel.
+
+    Folds the per-site work (gate double-layer build + contraction step)
+    into one compiled body function. HLO size for this stage becomes
+    independent of N, which shrinks compile time for long circuits.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    precision = backend.precision
+    C = mask.shape[0]
+
+    def body(ten, scanned):
+        A, mask_col = scanned
+        AO_I = jnp.einsum('blrd,dk->blrk', A, I_op, precision=precision)
+        AO_Z = jnp.einsum('blrd,dk->blrk', A, Z_op, precision=precision)
+        Ei_I = jnp.einsum('blrd,bLRd->blLrR', A.conj(), AO_I, precision=precision)
+        Ei_Z = jnp.einsum('blrd,bLRd->blLrR', A.conj(), AO_Z, precision=precision)
+        mi = mask_col.reshape(C, 1, 1, 1, 1, 1)
+        Ei = jnp.where(mi, jnp.expand_dims(Ei_Z, 0), jnp.expand_dims(Ei_I, 0))
+        new_ten = jnp.einsum('cbijpq,cbpqrs->cbijrs', ten, Ei, precision=precision)
+        return new_ten, None
+
+    # Scan over sites 1..N-1: axis-1 of batch_tensor and axis-1 of mask.
+    A_scanned = jnp.transpose(batch_tensor[:, 1:], (1, 0, 2, 3, 4))
+    mask_scanned = jnp.transpose(mask[:, 1:], (1, 0))
+    final_ten, _ = jax.lax.scan(body, ten_init, (A_scanned, mask_scanned))
+    return final_ten

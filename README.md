@@ -83,6 +83,37 @@ qiskit_trev/
 | **Ecosystem** | Standalone | Qiskit plugin |
 | **Install** | `pip install TREV` | `pip install qiskit-trev` |
 
+## Experimental JAX backend
+
+An optional JAX backend lives behind `qiskit_trev.backend`. It dispatches
+automatically on the input array type — pass a `jax.Array` to
+`batched_expectation_value`, `TensorRingState.build_batch`, or
+`BatchParameterShiftGradient(...).__call__` and the JAX path runs
+(jit-compiled end-to-end); pass a `torch.Tensor` and the existing
+PyTorch path runs unchanged.
+
+On a modern NVIDIA GPU the JAX gradient path is roughly 2–9× faster
+**per step** than the PyTorch path once warm. The first call pays an
+XLA compile cost (~1–3 s on GPU, ~30–50 s on TPU), so the wall-clock
+win only appears after ~100–500 iterations. **For shorter scripts or
+interactive development, enable the on-disk compilation cache so
+second-and-later Python processes skip compile entirely:**
+
+```python
+from qiskit_trev.backend import enable_compilation_cache
+
+enable_compilation_cache()  # writes to ~/.cache/qiskit_trev_jax
+```
+
+Pass a path explicitly if you want a different cache location. With
+the cache enabled, the first run of a given model/parameter-count still
+compiles normally; every subsequent Python process (notebook restart,
+repeated script, fresh pytest session) reloads the compiled artifact
+from disk in under a second.
+
+JAX is not a hard dependency — the backend module imports it lazily, so
+torch-only installs keep working.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit pull requests, report bugs, or suggest features.
