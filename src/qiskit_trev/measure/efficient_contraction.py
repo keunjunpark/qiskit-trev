@@ -198,31 +198,32 @@ def _batched_expectation_kernel(
 
 
 def _scan_sites_jax(backend, ten_init, batch_tensor, mask, Z_op, I_op):
-    """jax.lax.scan over the site loop in _batched_expectation_kernel.
+    """jax.lax.fori_loop over the site loop in _batched_expectation_kernel.
 
     Folds the per-site work (gate double-layer build + contraction step)
     into one compiled body function. HLO size for this stage becomes
     independent of N, which shrinks compile time for long circuits.
+
+    ``fori_loop`` over ``scan`` here because the loop produces no
+    per-iteration output (scan would return a stacked ``ys`` that we
+    immediately discard). ``fori_loop`` has a simpler contract and, in
+    practice, compiles marginally faster for this pattern.
     """
     import jax
     import jax.numpy as jnp
 
     precision = backend.precision
     C = mask.shape[0]
+    N = batch_tensor.shape[1]
 
-    def body(ten, scanned):
-        A, mask_col = scanned
+    def body(i, ten):
+        A = batch_tensor[:, i]
         AO_I = jnp.einsum('blrd,dk->blrk', A, I_op, precision=precision)
         AO_Z = jnp.einsum('blrd,dk->blrk', A, Z_op, precision=precision)
         Ei_I = jnp.einsum('blrd,bLRd->blLrR', A.conj(), AO_I, precision=precision)
         Ei_Z = jnp.einsum('blrd,bLRd->blLrR', A.conj(), AO_Z, precision=precision)
-        mi = mask_col.reshape(C, 1, 1, 1, 1, 1)
+        mi = mask[:, i].reshape(C, 1, 1, 1, 1, 1)
         Ei = jnp.where(mi, jnp.expand_dims(Ei_Z, 0), jnp.expand_dims(Ei_I, 0))
-        new_ten = jnp.einsum('cbijpq,cbpqrs->cbijrs', ten, Ei, precision=precision)
-        return new_ten, None
+        return jnp.einsum('cbijpq,cbpqrs->cbijrs', ten, Ei, precision=precision)
 
-    # Scan over sites 1..N-1: axis-1 of batch_tensor and axis-1 of mask.
-    A_scanned = jnp.transpose(batch_tensor[:, 1:], (1, 0, 2, 3, 4))
-    mask_scanned = jnp.transpose(mask[:, 1:], (1, 0))
-    final_ten, _ = jax.lax.scan(body, ten_init, (A_scanned, mask_scanned))
-    return final_ten
+    return jax.lax.fori_loop(1, N, body, ten_init)
