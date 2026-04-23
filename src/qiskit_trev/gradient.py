@@ -253,6 +253,14 @@ class BatchParameterShiftGradient:
         vmap-equivalent batching is expressed directly via the batch axis
         of build_batch, which is simpler than wrapping in :func:`jax.vmap`
         and compiles to the same program.
+
+        **First-call compile** is ~2–3 s on GPU, ~30–50 s on TPU. That cost
+        is paid once per ``(model, shift, P)`` key for the life of the
+        Python process. For iterative training it amortises after ~100–500
+        gradient steps; below that, the torch path is faster on wall time.
+        To collapse the compile cost across process restarts, enable JAX's
+        on-disk cache once per process via
+        :func:`qiskit_trev.backend.enable_compilation_cache`.
         """
         import jax
         import jax.numpy as jnp
