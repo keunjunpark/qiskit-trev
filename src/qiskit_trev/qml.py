@@ -477,6 +477,7 @@ class QMLModel:
 
     def _forward_jax(self, X, theta, *, theta_is_jax: bool):
         import jax
+        import jax.numpy as jnp
 
         from ._qml_jax import measure_all_qubits_jax, build_param_batch_jax
 
@@ -484,25 +485,60 @@ class QMLModel:
         theta_j = theta if theta_is_jax else self._to_jax(theta)
         data_idx, feat_idx, train_idx = self._jax_index_arrays()
 
-        cache_key = ("forward", X_j.shape, theta_j.shape[0])
-        jit_fn = self._jax_jit_cache.get(cache_key)
-        if jit_fn is None:
-            def _fn(X_arg, theta_arg):
-                p = build_param_batch_jax(
-                    X_arg, theta_arg, self._total_slots,
-                    data_idx, feat_idx, train_idx,
-                )
-                return measure_all_qubits_jax(
-                    self.n_qubits, self.rank, self._gate_templates, p
-                )
+        N = int(X_j.shape[0])
+        chunk = self.batch_size if self.batch_size is not None else N
+        chunk = max(1, min(chunk, N))
 
-            jit_fn = jax.jit(_fn)
-            self._jax_jit_cache[cache_key] = jit_fn
+        if chunk >= N:
+            # Fast path — single jit covers the whole batch.
+            cache_key = ("forward", X_j.shape, theta_j.shape[0])
+            jit_fn = self._jax_jit_cache.get(cache_key)
+            if jit_fn is None:
+                def _fn(X_arg, theta_arg):
+                    p = build_param_batch_jax(
+                        X_arg, theta_arg, self._total_slots,
+                        data_idx, feat_idx, train_idx,
+                    )
+                    return measure_all_qubits_jax(
+                        self.n_qubits, self.rank, self._gate_templates, p
+                    )
+                jit_fn = jax.jit(_fn)
+                self._jax_jit_cache[cache_key] = jit_fn
+            result = jit_fn(X_j, theta_j)
+        else:
+            # Chunked path — one jit per unique chunk size (usually just
+            # one compile for the full chunk, plus one for the remainder).
+            # Batch dim lives in X only; params_batch grows with it, so
+            # chunking X is enough to cap live memory.
+            def _fn_sized(C: int):
+                def _body(X_arg, theta_arg):
+                    p = build_param_batch_jax(
+                        X_arg, theta_arg, self._total_slots,
+                        data_idx, feat_idx, train_idx,
+                    )
+                    return measure_all_qubits_jax(
+                        self.n_qubits, self.rank, self._gate_templates, p
+                    )
+                return jax.jit(_body)
 
-        result = jit_fn(X_j, theta_j)
+            def _get_or_build(C: int):
+                key = ("forward_chunk", C, X_j.shape[1], theta_j.shape[0])
+                fn = self._jax_jit_cache.get(key)
+                if fn is None:
+                    fn = _fn_sized(C)
+                    self._jax_jit_cache[key] = fn
+                return fn
+
+            pieces = []
+            for start in range(0, N, chunk):
+                stop = min(start + chunk, N)
+                C = stop - start
+                fn = _get_or_build(C)
+                pieces.append(fn(X_j[start:stop], theta_j))
+            result = jnp.concatenate(pieces, axis=1)  # (Q, N)
+
         if theta_is_jax:
             return result  # caller is in JAX land
-        # Match input types: return torch on device. Output is float (real).
         import numpy as np
         return torch.from_numpy(np.asarray(result).copy()).to(self.device).to(torch.float64)
 

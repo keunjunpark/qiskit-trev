@@ -376,18 +376,64 @@ class BatchParameterShiftGradient:
             cache = {}
             self._jax_jit_cache = cache
 
-        cache_key = (id(model), shift, P)
+        # Respect the chunk_size knob so the JAX path shares OOM-handling
+        # discipline with the torch path. Current torch `auto` probes GPU
+        # memory with a torch kernel — the number is a conservative
+        # estimate for JAX (XLA usually allocates a bit more), but it's
+        # the right order of magnitude. If user sets chunk_size=None we
+        # keep the old "all at once" behaviour.
+        setting = self._chunk_size_setting
+        if isinstance(setting, int):
+            chunk_size = min(setting, P)
+        elif setting == "auto":
+            chunk_size = min(self._resolve_chunk_size(P), P)
+        else:
+            chunk_size = P
+
+        if chunk_size >= P:
+            return self._jax_grad_single_shot(params, P, cache).block_until_ready()
+
+        return self._jax_grad_chunked(params, P, chunk_size, cache).block_until_ready()
+
+    def _jax_grad_constants(self):
+        """Cache the per-model JAX constants (paulis, Z/I, coeffs).
+
+        Rebuilt lazily and reused across both single-shot and chunked
+        gradient paths so we don't pay the torch→jax conversion twice.
+        """
+        import jax.numpy as jnp
+        import numpy as np
+
+        cache = self._jax_jit_cache
+        key = ("constants", id(self._model))
+        if key in cache:
+            return cache[key]
+        ham = self._model._hamiltonian
+        paulis = jnp.asarray(ham.get_bool_pauli_tensor().numpy())
+        coeffs = jnp.asarray(
+            np.asarray(ham.coefficients, dtype=np.complex64)
+        )
+        Z_op = jnp.asarray([[1, 0], [0, -1]], dtype=jnp.complex64)
+        I_op = jnp.eye(2, dtype=jnp.complex64)
+        cache[key] = (paulis, coeffs, Z_op, I_op)
+        return cache[key]
+
+    def _jax_grad_single_shot(self, params, P: int, cache: dict):
+        """Original non-chunked kernel — kept as the fast path when P is
+        small enough that chunking would add overhead."""
+        import jax
+        import jax.numpy as jnp
+
+        from .backend import JAX_BACKEND
+        from .measure.efficient_contraction import _batched_expectation_kernel
+        from .tensor_ring._state_jax import build_batch_jax
+
+        model = self._model
+        shift = self._shift
+        cache_key = ("single", id(model), shift, P)
         jit_fn = cache.get(cache_key)
-
         if jit_fn is None:
-            ham = model._hamiltonian
-            paulis = jnp.asarray(ham.get_bool_pauli_tensor().numpy())
-            coeffs = jnp.asarray(
-                np.asarray(ham.coefficients, dtype=np.complex64)
-            )
-            Z_op = jnp.asarray([[1, 0], [0, -1]], dtype=jnp.complex64)
-            I_op = jnp.eye(2, dtype=jnp.complex64)
-
+            paulis, coeffs, Z_op, I_op = self._jax_grad_constants()
             num_qubits = model._num_qubits
             rank = model.rank
             gates = model._gate_templates
@@ -403,21 +449,88 @@ class BatchParameterShiftGradient:
                     axis=0,
                 )
                 state = build_batch_jax(num_qubits, rank, gates, all_shifted)
-                B = 2 * P
-                total_init = jnp.zeros(B, dtype=jnp.complex64)
+                total_init = jnp.zeros(2 * P, dtype=jnp.complex64)
                 evs = _batched_expectation_kernel(
-                    JAX_BACKEND,
-                    state,
-                    paulis,
-                    coeffs,
-                    Z_op,
-                    I_op,
-                    total_init,
-                    None,
+                    JAX_BACKEND, state, paulis, coeffs, Z_op, I_op,
+                    total_init, None,
                 )
                 return (evs[:P] - evs[P:]) / denom
 
             jit_fn = jax.jit(_grad_fn)
             cache[cache_key] = jit_fn
+        return jit_fn(params)
 
-        return jit_fn(params).block_until_ready()
+    def _jax_grad_chunked(self, params, P: int, chunk_size: int, cache: dict):
+        """Chunked JAX gradient — applies at most ``2 * chunk_size``
+        shifted parameter vectors in a single JIT graph.
+
+        One compile per distinct chunk size: ``chunk_size`` for all full
+        chunks, plus one extra compile for the remainder if P isn't a
+        multiple of chunk_size.
+        """
+        import jax
+        import jax.numpy as jnp
+
+        from .backend import JAX_BACKEND
+        from .measure.efficient_contraction import _batched_expectation_kernel
+        from .tensor_ring._state_jax import build_batch_jax
+
+        model = self._model
+        shift = self._shift
+        paulis, coeffs, Z_op, I_op = self._jax_grad_constants()
+        num_qubits = model._num_qubits
+        rank = model.rank
+        gates = model._gate_templates
+        denom = 2.0 * math.sin(shift)
+
+        def _make_chunk_kernel(C: int, P_arg: int):
+            """JIT a kernel that shifts params at [start : start+C]."""
+            def _chunk_grad(params_j, start):
+                # rows selects which parameter index to shift for each of C
+                # shifted slots. `start` is traced — no recompile across
+                # different offsets.
+                rows = jnp.arange(C)
+                idx = start + rows  # (C,)
+                eye_cols = jnp.zeros((C, P_arg), dtype=params_j.dtype)
+                eye_cols = eye_cols.at[rows, idx].set(1.0)
+                shifted_plus = params_j[None] + shift * eye_cols
+                shifted_minus = params_j[None] - shift * eye_cols
+                all_shifted = jnp.concatenate(
+                    [shifted_plus, shifted_minus], axis=0
+                )
+                state = build_batch_jax(
+                    num_qubits, rank, gates, all_shifted
+                )
+                total_init = jnp.zeros(2 * C, dtype=jnp.complex64)
+                evs = _batched_expectation_kernel(
+                    JAX_BACKEND, state, paulis, coeffs, Z_op, I_op,
+                    total_init, None,
+                )
+                return (evs[:C] - evs[C:]) / denom
+            return jax.jit(_chunk_grad)
+
+        def _get_or_build(C: int):
+            key = ("chunk", id(model), shift, P, C)
+            fn = cache.get(key)
+            if fn is None:
+                fn = _make_chunk_kernel(C, P)
+                cache[key] = fn
+            return fn
+
+        full_chunks = P // chunk_size
+        remainder = P - full_chunks * chunk_size
+
+        result = jnp.zeros(P, dtype=jnp.float32)
+        full_fn = _get_or_build(chunk_size) if full_chunks else None
+        for i in range(full_chunks):
+            start = i * chunk_size
+            chunk_grad = full_fn(params, start)
+            result = result.at[start:start + chunk_size].set(chunk_grad)
+
+        if remainder:
+            remainder_fn = _get_or_build(remainder)
+            start = full_chunks * chunk_size
+            chunk_grad = remainder_fn(params, start)
+            result = result.at[start:].set(chunk_grad)
+
+        return result

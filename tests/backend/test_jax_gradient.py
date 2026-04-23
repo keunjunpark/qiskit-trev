@@ -83,6 +83,23 @@ def test_gradient_dispatch_returns_torch_on_torch_input():
     assert out.shape == (P,)
 
 
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 4])
+def test_chunked_jax_gradient_matches_unchunked(chunk_size):
+    """Chunking the JAX gradient path must not change the math."""
+    model, P = _build_model(4, 1, 4)
+    rng = np.random.RandomState(7)
+    params_np = (rng.rand(P) * 2 * math.pi).astype(np.float32)
+
+    g_full = BatchParameterShiftGradient(model).__call__(jnp.asarray(params_np))
+    g_chunked = BatchParameterShiftGradient(
+        model, chunk_size=chunk_size
+    ).__call__(jnp.asarray(params_np))
+
+    np.testing.assert_allclose(
+        np.asarray(g_chunked), np.asarray(g_full), atol=5e-4, rtol=1e-3
+    )
+
+
 def test_gradient_jit_cache_hits_on_same_shape():
     """Second call with same-shape params reuses the compiled kernel."""
     model, P = _build_model(4, 1, 4)
@@ -93,5 +110,8 @@ def test_gradient_jit_cache_hits_on_same_shape():
     grad_fn(p1)
     grad_fn(p2)
 
-    # Cache should have exactly one entry for this (model, shift, P).
-    assert len(grad_fn._jax_jit_cache) == 1
+    # One jit entry per unique (path, model, shift, P) — two same-shape
+    # calls share the same compiled kernel. Model-constants live under a
+    # separate "constants" cache key.
+    jit_keys = [k for k in grad_fn._jax_jit_cache if k[0] in ("single", "chunk")]
+    assert len(jit_keys) == 1, f"unexpected jit entries: {jit_keys}"
