@@ -14,7 +14,9 @@ from torch import Tensor
 
 from .model import TensorRingModel
 from .tensor_ring.state import TensorRingState
-from .measure.efficient_contraction import expectation_value as ev_efficient
+from .measure.efficient_contraction import (
+    batched_expectation_value as batched_ev_efficient,
+)
 from .measure.full_contraction import expectation_value as ev_full
 
 
@@ -71,11 +73,13 @@ def _gpu_worker(
         )
         batch_tensor = state.build_batch(model._gate_templates, batch)
 
-        evs = torch.zeros(2 * C, dtype=torch.float64)
-        for i in range(2 * C):
-            if model._use_efficient:
-                evs[i] = ev_efficient(batch_tensor[i], model._hamiltonian)
-            else:
+        if model._use_efficient:
+            evs = batched_ev_efficient(batch_tensor, model._hamiltonian).to(
+                torch.float64
+            )
+        else:
+            evs = torch.zeros(2 * C, dtype=torch.float64)
+            for i in range(2 * C):
                 evs[i] = ev_full(batch_tensor[i], model._hamiltonian)
 
         grad_shared[start:stop] = 0.5 * (evs[:C] - evs[C:]) / math.sin(shift)
@@ -145,15 +149,23 @@ class BatchParameterShiftGradient:
         return P
 
     @torch.no_grad()
-    def __call__(self, params: Tensor) -> Tensor:
+    def __call__(self, params):
         """Compute gradient via batched parameter shift.
 
+        Dispatches on ``type(params)`` — ``torch.Tensor`` keeps the torch
+        path (single- or multi-GPU); ``jax.Array`` runs a JIT-compiled JAX
+        path that fuses build_batch + batched expectation + shift diff.
+
         Args:
-            params: (P,) tensor of parameter values.
+            params: (P,) array of parameter values.
 
         Returns:
-            (P,) tensor of gradients.
+            (P,) array of gradients in the same backend as ``params``.
         """
+        mod = type(params).__module__
+        if mod.startswith("jax") or mod.startswith("jaxlib"):
+            return self._compute_single_jax(params)
+
         P = len(params)
         if P == 0:
             return torch.zeros(0, dtype=torch.float64)
@@ -194,11 +206,13 @@ class BatchParameterShiftGradient:
             )
             batch_tensor = state.build_batch(model._gate_templates, base)
 
-            evs = torch.zeros(2 * C, dtype=torch.float64)
-            for i in range(2 * C):
-                if model._use_efficient:
-                    evs[i] = ev_efficient(batch_tensor[i], model._hamiltonian)
-                else:
+            if model._use_efficient:
+                evs = batched_ev_efficient(batch_tensor, model._hamiltonian).to(
+                    torch.float64
+                )
+            else:
+                evs = torch.zeros(2 * C, dtype=torch.float64)
+                for i in range(2 * C):
                     evs[i] = ev_full(batch_tensor[i], model._hamiltonian)
 
             grad[start:stop] = (evs[:C] - evs[C:]) / denom
@@ -230,3 +244,78 @@ class BatchParameterShiftGradient:
                 f.result()  # raises exceptions from workers
 
         return grad_shared.clone()
+
+    def _compute_single_jax(self, params):
+        """JIT-compiled JAX gradient path.
+
+        Fuses build_batch + batched expectation value + shift diff into one
+        XLA graph per (model, shift, P) combination. Per plan/14 Step 4 the
+        vmap-equivalent batching is expressed directly via the batch axis
+        of build_batch, which is simpler than wrapping in :func:`jax.vmap`
+        and compiles to the same program.
+        """
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+
+        from .backend import JAX_BACKEND
+        from .measure.efficient_contraction import _batched_expectation_kernel
+        from .tensor_ring._state_jax import build_batch_jax
+
+        P = int(params.shape[0])
+        if P == 0:
+            return jnp.zeros(0, dtype=jnp.float32)
+
+        model = self._model
+        shift = self._shift
+
+        cache = getattr(self, "_jax_jit_cache", None)
+        if cache is None:
+            cache = {}
+            self._jax_jit_cache = cache
+
+        cache_key = (id(model), shift, P)
+        jit_fn = cache.get(cache_key)
+
+        if jit_fn is None:
+            ham = model._hamiltonian
+            paulis = jnp.asarray(ham.get_bool_pauli_tensor().numpy())
+            coeffs = jnp.asarray(
+                np.asarray(ham.coefficients, dtype=np.complex64)
+            )
+            Z_op = jnp.asarray([[1, 0], [0, -1]], dtype=jnp.complex64)
+            I_op = jnp.eye(2, dtype=jnp.complex64)
+
+            num_qubits = model._num_qubits
+            rank = model.rank
+            gates = model._gate_templates
+            denom = 2.0 * math.sin(shift)
+
+            def _grad_fn(params_j):
+                eye = jnp.eye(P, dtype=params_j.dtype)
+                all_shifted = jnp.concatenate(
+                    [
+                        params_j[None] + shift * eye,
+                        params_j[None] - shift * eye,
+                    ],
+                    axis=0,
+                )
+                state = build_batch_jax(num_qubits, rank, gates, all_shifted)
+                B = 2 * P
+                total_init = jnp.zeros(B, dtype=jnp.complex64)
+                evs = _batched_expectation_kernel(
+                    JAX_BACKEND,
+                    state,
+                    paulis,
+                    coeffs,
+                    Z_op,
+                    I_op,
+                    total_init,
+                    None,
+                )
+                return (evs[:P] - evs[P:]) / denom
+
+            jit_fn = jax.jit(_grad_fn)
+            cache[cache_key] = jit_fn
+
+        return jit_fn(params).block_until_ready()
