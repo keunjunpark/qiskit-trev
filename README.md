@@ -111,6 +111,28 @@ compiles normally; every subsequent Python process (notebook restart,
 repeated script, fresh pytest session) reloads the compiled artifact
 from disk in under a second.
 
+**On Colab, point the cache at Google Drive** — Colab VMs wipe local
+disk on every disconnect, so `~/.cache/...` doesn't actually persist
+between sessions:
+
+```python
+from google.colab import drive
+drive.mount('/content/drive')
+
+from qiskit_trev.backend import enable_compilation_cache
+enable_compilation_cache('/content/drive/MyDrive/qiskit_trev_cache')
+```
+
+With the Drive-mounted cache, long-running research survives VM
+disconnects — the compile artifact follows your notebook across
+sessions. First run still pays full compile; every session afterwards
+loads from Drive in ~1 s regardless of whether the Colab VM is new.
+
+The cache is invalidated automatically when JAX / XLA upgrade, when
+the target device model changes, or when the traced program changes
+(e.g. new gate in the circuit, different χ) — so stale artifacts
+never silently run.
+
 JAX is not a hard dependency — the backend module imports it lazily, so
 torch-only installs keep working.
 
