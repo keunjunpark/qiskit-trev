@@ -92,10 +92,10 @@ def expectation_value(
 
 @torch.no_grad()
 def batched_expectation_value(
-    batch_tensor: Tensor,
+    batch_tensor,
     hamiltonian: Hamiltonian,
     chunk_size: int | None = None,
-) -> Tensor:
+):
     """Compute <psi|H|psi> for a batch of tensor ring states.
 
     Vectorizes the double-layer transfer matrix contraction across
@@ -103,20 +103,26 @@ def batched_expectation_value(
 
     Args:
         batch_tensor: (B, N, chi, chi, 2) batched tensor ring states.
+            ``torch.Tensor`` or ``jax.Array``; the backend is dispatched by
+            type.
         hamiltonian: Hamiltonian (Z/I terms only).
         chunk_size: Process Hamiltonian terms in chunks. None = all at once.
 
     Returns:
-        (B,) tensor of real expectation values.
+        (B,) array of real expectation values on the same backend as input.
     """
     backend = get_backend(batch_tensor)
     device = batch_tensor.device
+    B = batch_tensor.shape[0]
 
     paulis = backend.to_device(hamiltonian.get_bool_pauli_tensor(), device)  # (T, N)
     coeffs = backend.as_tensor(hamiltonian.coefficients, device=device)
+    Z_op = backend.tensor([[1, 0], [0, -1]], device=device)
+    I_op = backend.eye(2, device=device)
+    total_init = backend.zeros(B, device=device)
 
     return _batched_expectation_kernel(
-        backend, batch_tensor, paulis, coeffs, chunk_size
+        backend, batch_tensor, paulis, coeffs, Z_op, I_op, total_init, chunk_size
     )
 
 
@@ -125,25 +131,23 @@ def _batched_expectation_kernel(
     batch_tensor,
     paulis,
     coeffs,
+    Z_op,
+    I_op,
+    total,
     chunk_size: int | None,
 ):
-    """Backend-agnostic kernel for batched <psi|H|psi>.
+    """Pure backend-agnostic kernel for batched <psi|H|psi>.
 
-    Pulled out of :func:`batched_expectation_value` so the same body can be
-    wrapped by backend-specific JIT compilers (``jax.jit``) in later steps.
+    All device-bound constants (``Z_op``, ``I_op``, ``total`` accumulator) are
+    created by the caller and passed in. The kernel never touches ``.device``,
+    which lets it be wrapped with ``jax.jit`` — inside jit tracing, array
+    proxies do not expose ``.device``.
     """
-    device = batch_tensor.device
-    B = batch_tensor.shape[0]
     N = batch_tensor.shape[1]
     T = paulis.shape[0]
 
-    Z_op = backend.tensor([[1, 0], [0, -1]], device=device)
-    I_op = backend.eye(2, device=device)
-
     if chunk_size is None:
         chunk_size = T
-
-    total = backend.zeros(B, device=device)
 
     for start in range(0, T, chunk_size):
         stop = min(start + chunk_size, T)
