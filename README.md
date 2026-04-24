@@ -99,13 +99,24 @@ MIT License
 
 ## Citation
 
-If you use qiskit-trev in your research, please cite:
+If you use qiskit-trev in your research, please cite **both** the
+underlying method (TREV paper) and this implementation:
 
 ```bibtex
+@unpublished{park2025trev,
+  title={{TREV}: Python Library for Efficient Implementations of Variational Quantum Algorithms for Optimization using Tensor Networks},
+  author={Park, Keun Jun and Peddireddy, Dheeraj and Aggarwal, Vaneet},
+  year={2025},
+  note={Submitted to ACM Transactions on Quantum Computing; revised April 2026},
+}
+
 @software{qiskit_trev,
-  title={qiskit-trev: PyTorch-based Tensor Ring VQA Simulation for Qiskit},
-  author={Park, Keunjun},
+  title={qiskit-trev: Tensor Ring VQA Simulation as a Qiskit Plugin},
+  author={Park, Keun Jun},
+  year={2026},
+  version={0.2.1},
   url={https://github.com/keunjunpark/qiskit-trev},
+  note={Qiskit plugin built on TREV}
 }
 ```
 
