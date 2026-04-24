@@ -119,32 +119,58 @@ class QMLModel:
     def n_data(self) -> int:
         return len(self._data_indices)
 
-    def auto_tune(self, N: int) -> None:
+    def auto_tune(self, N: int, *, probe: str = "analytical") -> None:
         """Auto-tune batch sizes for QML workloads.
 
         QML has a 2D batching problem: data samples × parameter shifts.
         This method probes GPU memory to find:
-          1. batch_size — max samples per _measure_all_qubits call
-          2. _ps_chunk  — max parameter shifts per gradient call,
-                          computed as batch_size // (2 * N)
+          1. ``batch_size`` — max samples per ``_measure_all_qubits`` call
+             (torch kernel, unchanged).
+          2. ``_ps_chunk`` — max parameter shifts per JAX gradient call.
+             How ``_ps_chunk`` is determined depends on ``probe=``.
 
-        Call once after construction with the training set size:
+        Call once after construction with the training set size::
+
             model.auto_tune(len(X_train))
 
         Args:
             N: Number of data samples (training set size).
+            probe: How to pick ``_ps_chunk`` on the JAX path:
+
+              - ``"analytical"`` (default, ~instant): closed-form memory
+                estimate from the target workload ``(Q, 2·chunk·N, χ⁴)``
+                with a conservative 5× XLA slack. Never OOMs at
+                ``xla_gpu_autotune_level ≤ 2``.
+              - ``"jit"`` (~1–20 min): binary-search the real JIT'd
+                kernel. Most accurate but every trial compiles — on
+                cold-start users wait minutes. Opt-in only for users
+                who want to squeeze the last MB of HBM.
+              - ``"none"``: skip the JAX refinement, use the torch-
+                derived chunk directly. May OOM; use only when you know
+                torch's estimate is correct for your workload.
+
+            ``max_ps_chunk=K`` set at construction time **always**
+            short-circuits whatever ``probe`` would do — the override is
+            trusted and no GPU measurement runs.
         """
         from .optimization.auto_batch import auto_batch_size as _abs
+
+        if probe not in ("analytical", "jit", "none"):
+            raise ValueError(
+                f'probe must be one of "analytical"/"jit"/"none", got {probe!r}'
+            )
 
         dev = torch.device(self.device)
         if dev.type != "cuda":
             self.batch_size = N
-            self._ps_chunk = self.n_trainable
+            ps = self.n_trainable
+            if self._max_ps_chunk is not None:
+                ps = min(ps, self._max_ps_chunk)
+            self._ps_chunk = ps  # legacy attribute kept for callers reading it
+            self._ps_chunk_cache = {N: ps}
             return
 
-        # Step 1: find max batch_size for _measure_all_qubits
-        # Use _measure_all_qubits itself as the probe to capture exact memory
-        # (including the (Q, B, chi^4) intermediate tensor).
+        # Step 1: torch-side batch_size probe. Unchanged.
         dummy = torch.zeros(1, self._total_slots, dtype=torch.float32, device=dev)
         old_bs = self.batch_size
 
@@ -159,31 +185,72 @@ class QMLModel:
             safety_frac=0.85, warmup=1,
         )
 
-        # Step 2: derive _ps_chunk from batch_size
-        # Each param-shift chunk processes 2 * chunk * N samples.
-        # Max chunk = batch_size // (2 * N), clamped to [1, n_trainable].
+        # Step 2: starting point from the torch probe.
         ps_chunk = max(1, min(self.batch_size // (2 * N), self.n_trainable))
 
-        # Step 3 (JAX only): the torch probe above measures a different
-        # kernel than the JAX gradient uses. XLA pre-allocates during
-        # compile and the fused `(2·chunk·N, total_slots)` → measure
-        # intermediate usually OOMs at a smaller chunk than the torch
-        # probe's 85% memory fit suggests. Refine with a real JAX JIT
-        # probe — binary search on "did compile + first run succeed?"
-        if _resolve_backend_pref(self._backend_arg) == "jax" and ps_chunk > 1:
-            ps_chunk = self._probe_jax_ps_chunk(N, upper=ps_chunk)
+        # Step 3: refine for the JAX path. Order:
+        #   1. max_ps_chunk set → trust the user, skip everything.
+        #   2. probe="analytical" → closed-form memory estimate. Default.
+        #   3. probe="jit" → real binary search. Accurate, slow.
+        #   4. probe="none" → torch value as-is.
+        is_jax = _resolve_backend_pref(self._backend_arg) == "jax"
+        if is_jax and self._max_ps_chunk is None and ps_chunk > 1:
+            if probe == "analytical":
+                ps_chunk = min(ps_chunk, self._analytical_ps_chunk(N))
+            elif probe == "jit":
+                ps_chunk = self._probe_jax_ps_chunk(N, upper=ps_chunk)
+            # probe == "none": ps_chunk stays as the torch value.
 
-        # User override: hard ceiling on ps_chunk regardless of probe.
+        # User override always wins.
         if self._max_ps_chunk is not None:
             ps_chunk = min(ps_chunk, self._max_ps_chunk)
 
         self._ps_chunk_cache = {N: ps_chunk}
 
         n_chunks = math.ceil(self.n_trainable / ps_chunk)
-        print(f"QMLModel.auto_tune(N={N}):")
+        probe_note = f" [probe={probe}]" if is_jax else ""
+        override_note = (
+            f" (capped by max_ps_chunk={self._max_ps_chunk})"
+            if self._max_ps_chunk is not None
+            else ""
+        )
+        print(f"QMLModel.auto_tune(N={N}){probe_note}:")
         print(f"  batch_size = {self.batch_size:,} samples")
         print(f"  _ps_chunk  = {ps_chunk} params/chunk "
-              f"({ps_chunk * 2 * N:,} evals/chunk, {n_chunks} chunks/epoch)")
+              f"({ps_chunk * 2 * N:,} evals/chunk, "
+              f"{n_chunks} chunks/epoch){override_note}")
+
+    def _analytical_ps_chunk(self, N: int) -> int:
+        """Closed-form ``_ps_chunk`` estimate for the JAX gradient path.
+
+        The dominant memory consumer in
+        ``measure_all_qubits_jax`` is the ``(Q, 2·chunk·N, χ⁴)``
+        float32 intermediate, and XLA double-buffers it — so the
+        actual allocation is ``2 × Q × 2·chunk·N × χ⁴ × 4`` bytes plus
+        autotune scratch. Calibration from probe data on T4 / A100 / A100-80:
+
+        - A clean ``RESOURCE_EXHAUSTED`` sits at exactly 2× per-buffer
+          (double-buffering).
+        - ``--xla_gpu_autotune_level=4`` (XLA default) inflates effective
+          memory 10–20× during cuBLAS candidate search. Our analytical
+          estimate does NOT capture that; it assumes ``autotune_level ≤ 2``
+          (set by :func:`enable_compilation_cache`).
+
+        Formula (conservative 5× slack covers both double-buffering and
+        moderate autotune scratch):
+
+        .. math::
+            \\text{max\\_chunk} = \\frac{\\text{free\\_bytes} \\cdot 0.85}
+                                       {Q \\cdot 2 \\cdot N \\cdot \\chi^4 \\cdot 4 \\cdot 5}
+        """
+        free_b, _ = torch.cuda.mem_get_info(torch.device(self.device))
+        Q, chi = self.n_qubits, self.rank
+        bytes_per_elem = 4     # float32 intermediates
+        xla_slack = 5.0        # empirical upper bound at autotune_level <= 2
+        safety = 0.85
+        per_chunk_bytes = Q * 2 * N * (chi ** 4) * bytes_per_elem * xla_slack
+        max_chunk = int((free_b * safety) / max(per_chunk_bytes, 1))
+        return max(1, min(max_chunk, self.n_trainable))
 
     def _build_param_batch(self, X: Tensor, theta: Tensor) -> Tensor:
         """Build (N, P_total) parameter tensor — vectorized, no Python loops.

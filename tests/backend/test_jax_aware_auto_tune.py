@@ -99,20 +99,15 @@ def _vqe_model(N=4, reps=1, rank=4):
     return TensorRingModel(qc, obs, rank=rank), P
 
 
-def test_vqe_max_chunk_size_clamps_auto():
-    """Even if auto-tune and the JAX probe like a larger chunk,
-    max_chunk_size must cap it."""
+def test_vqe_max_chunk_size_short_circuits():
+    """max_chunk_size must prevent the analytical estimator AND the JIT
+    probe from running — the user's declared ceiling is trusted."""
     model, P = _vqe_model(N=4, reps=1)
     grad_fn = BatchParameterShiftGradient(
         model, chunk_size="auto", max_chunk_size=2, backend="jax"
     )
     params = jnp.asarray(np.zeros(P, dtype=np.float32))
-    grad_fn(params)  # triggers chunk-size resolution + caching
-    assert grad_fn._jax_probed_chunk[P] <= P
-    # The ceiling must apply: the actual chunk used is bounded at 2.
-    # Validate by inspecting the jit cache keys — chunked path stores
-    # ("chunk", ..., C) entries. The largest C in the cache is the
-    # chunk actually used.
+    grad_fn(params)
     chunk_keys = [k for k in grad_fn._jax_jit_cache if k[0] == "chunk"]
     used_chunks = [k[-1] for k in chunk_keys]
     if used_chunks:
@@ -125,26 +120,44 @@ def test_vqe_max_chunk_size_validation():
         BatchParameterShiftGradient(model, max_chunk_size=0)
 
 
-def test_vqe_probe_caches_per_P(monkeypatch):
-    """Second call with the same P must reuse the cached probe value."""
+def test_vqe_analytical_is_default_no_jit_probe(monkeypatch):
+    """Default ``chunk_size="auto"`` path must not invoke the JIT probe."""
     model, P = _vqe_model(N=4, reps=1)
     grad_fn = BatchParameterShiftGradient(
-        model, chunk_size="auto", backend="jax", max_chunk_size=3,
+        model, chunk_size="auto", backend="jax",
+    )
+    probe_calls = []
+    monkeypatch.setattr(
+        grad_fn, "_probe_jax_chunk",
+        lambda P_, upper: probe_calls.append(P_) or 1,
+    )
+    grad_fn(jnp.asarray(np.zeros(P, dtype=np.float32)))
+    assert probe_calls == [], (
+        "analytical default should NOT call the JIT probe — got "
+        f"{len(probe_calls)} probe calls"
+    )
+
+
+def test_vqe_jit_probe_cached_per_P(monkeypatch):
+    """Opt-in chunk_size='jit' still caches its result per P."""
+    model, P = _vqe_model(N=4, reps=1)
+    grad_fn = BatchParameterShiftGradient(
+        model, chunk_size="jit", backend="jax",
     )
     probe_calls = []
     real_probe = grad_fn._probe_jax_chunk
 
-    def counting_probe(P_, upper):
+    def counting(P_, upper):
         probe_calls.append(P_)
         return real_probe(P_, upper)
 
-    monkeypatch.setattr(grad_fn, "_probe_jax_chunk", counting_probe)
+    monkeypatch.setattr(grad_fn, "_probe_jax_chunk", counting)
 
     params = jnp.asarray(np.zeros(P, dtype=np.float32))
     grad_fn(params)
     grad_fn(params)
     grad_fn(params)
-    assert len(probe_calls) == 1, f"probed {len(probe_calls)} times for same P"
+    assert len(probe_calls) == 1, f"probed {len(probe_calls)} times"
 
 
 def test_vqe_auto_skips_probe_when_torch_tuned_is_one(monkeypatch):
@@ -261,6 +274,37 @@ def test_qml_max_ps_chunk_clamps_auto_tune_on_cpu():
     # _ps_chunk_cache. Instead we verify the override is stored and
     # available to the gradient path.
     assert model._max_ps_chunk == 2
+
+
+def test_qml_auto_tune_rejects_invalid_probe():
+    model = _qml_model(n_qubits=3, n_layers=1)
+    with pytest.raises(ValueError, match="probe"):
+        model.auto_tune(4, probe="bogus")
+
+
+def test_qml_analytical_estimator_is_bounded():
+    """Analytical estimator must return a chunk in [1, n_trainable]
+    regardless of how free GPU memory is reported. We can't probe real
+    CUDA on the CPU CI, but we can force-call the helper with a mocked
+    mem_get_info."""
+    model = _qml_model(n_qubits=3, n_layers=2)
+
+    # Stub torch.cuda.mem_get_info so the helper works without CUDA.
+    class _FakeCuda:
+        @staticmethod
+        def mem_get_info(device=None):
+            return (40 * 1024 ** 3, 40 * 1024 ** 3)  # 40 GB free
+    fake_torch_cuda = _FakeCuda()
+
+    import qiskit_trev.qml as qml_mod
+    orig = qml_mod.torch.cuda.mem_get_info
+    qml_mod.torch.cuda.mem_get_info = fake_torch_cuda.mem_get_info
+    try:
+        result = model._analytical_ps_chunk(N=50)
+    finally:
+        qml_mod.torch.cuda.mem_get_info = orig
+
+    assert 1 <= result <= model.n_trainable
 
 
 def test_qml_probe_fakes_oom_returns_safe_cap(monkeypatch):

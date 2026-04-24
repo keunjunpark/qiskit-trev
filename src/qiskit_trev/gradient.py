@@ -127,7 +127,16 @@ class BatchParameterShiftGradient:
     Args:
         model: TensorRingModel to compute gradients for.
         shift: Parameter shift amount (default pi/2).
-        chunk_size: Params per chunk. None = all at once. "auto" = auto-tune on GPU.
+        chunk_size: Params per chunk.
+
+            - ``None``: all P params in one JIT graph (may OOM at large P).
+            - ``int``: exact chunk, no probe.
+            - ``"auto"`` (recommended): analytical memory estimator —
+              closed-form, ~instant. Never OOMs at
+              ``xla_gpu_autotune_level <= 2``.
+            - ``"jit"``: binary-search via real JIT'd compile. Most
+              accurate; pays 30-600 s cold-start. Opt-in for squeezing
+              the last MB.
         num_gpus: Number of GPUs to use. None = auto-detect. 0 or 1 = single device.
         backend: Force a compute backend.
 
@@ -393,22 +402,41 @@ class BatchParameterShiftGradient:
         if isinstance(setting, int):
             chunk_size = min(setting, P)
         elif setting == "auto":
-            # Torch probe gives an optimistic upper bound; JAX kernel has
-            # a larger memory footprint, so refine with a JAX-native
-            # probe. Cache per P so we probe once per session.
-            torch_tuned = min(self._resolve_chunk_size(P), P)
-            if P in self._jax_probed_chunk:
+            # Priority (fast → slow):
+            #   1. max_chunk_size set — trust the user, skip all probing.
+            #   2. Cached from an earlier call on this object — free.
+            #   3. Analytical estimator — closed-form, ~instant.
+            #   4. JIT probe — only when explicitly requested via
+            #      chunk_size_setting == "jit".
+            # The old default was (4), which cost 30-600 s cold-start.
+            if self._max_chunk_size is not None:
+                chunk_size = min(self._max_chunk_size, P)
+            elif P in self._jax_probed_chunk:
                 chunk_size = self._jax_probed_chunk[P]
-            elif torch_tuned <= 1:
-                chunk_size = 1
-                self._jax_probed_chunk[P] = 1
             else:
-                chunk_size = self._probe_jax_chunk(P, upper=torch_tuned)
+                torch_tuned = min(self._resolve_chunk_size(P), P)
+                chunk_size = self._analytical_chunk(P, upper=torch_tuned)
+                self._jax_probed_chunk[P] = chunk_size
+        elif setting == "jit":
+            # Opt-in for the old binary-search behaviour. Slow but
+            # maximum memory utilisation.
+            if self._max_chunk_size is not None:
+                chunk_size = min(self._max_chunk_size, P)
+            elif P in self._jax_probed_chunk:
+                chunk_size = self._jax_probed_chunk[P]
+            else:
+                torch_tuned = min(self._resolve_chunk_size(P), P)
+                chunk_size = (
+                    1 if torch_tuned <= 1
+                    else self._probe_jax_chunk(P, upper=torch_tuned)
+                )
                 self._jax_probed_chunk[P] = chunk_size
         else:
             chunk_size = P
 
-        # Hard ceiling from user override.
+        # Hard ceiling from user override (also the only path that matters
+        # when chunk_size came from "auto"/"jit" + max_chunk_size already
+        # applied above — this is a safety net).
         if self._max_chunk_size is not None:
             chunk_size = min(chunk_size, self._max_chunk_size)
 
@@ -416,6 +444,30 @@ class BatchParameterShiftGradient:
             return self._jax_grad_single_shot(params, P, cache).block_until_ready()
 
         return self._jax_grad_chunked(params, P, chunk_size, cache).block_until_ready()
+
+    def _analytical_chunk(self, P: int, upper: int) -> int:
+        """Closed-form chunk-size estimate for the JAX gradient path.
+
+        The dominant intermediate in ``_batched_expectation_kernel`` is
+        ``(C, 2·chunk, χ, χ, χ, χ)`` float32 where ``C`` is the number
+        of Hamiltonian terms. XLA double-buffers; analytical bytes ≈
+        ``2 × C × 2·chunk × χ⁴ × 4`` plus moderate autotune scratch.
+        A 5× slack covers both for ``xla_gpu_autotune_level ≤ 2``.
+
+        At higher autotune levels (the XLA default is 4) this formula is
+        too optimistic — cuBLAS candidate scratch is 10–20× per-buffer.
+        Pair with :func:`qiskit_trev.backend.enable_compilation_cache`,
+        which sets ``autotune_level=2``, or pass ``max_chunk_size=K``.
+        """
+        ham = self._model._hamiltonian
+        C = max(1, len(ham.coefficients))
+        chi = self._model.rank
+        free_b, _ = torch.cuda.mem_get_info()
+        xla_slack = 5.0
+        safety = 0.85
+        per_chunk_bytes = 2 * C * (chi ** 4) * 4 * xla_slack
+        max_chunk = int((free_b * safety) / max(per_chunk_bytes, 1))
+        return max(1, min(max_chunk, upper))
 
     def _probe_jax_chunk(self, P: int, upper: int) -> int:
         """Binary-search the largest gradient chunk that compiles + runs
