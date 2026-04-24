@@ -78,6 +78,12 @@ def test_helper_various_caps(cap):
     assert result == expected
 
 
+def test_helper_upper_equals_lower():
+    """Edge case: degenerate range — return lower regardless of try_fn."""
+    assert jit_chunk_binary_search(lambda c: True, upper=3, lower=3) == 3
+    assert jit_chunk_binary_search(lambda c: False, upper=3, lower=3) == 3
+
+
 # ---------- BatchParameterShiftGradient ----------------------------------
 
 def _vqe_model(N=4, reps=1, rank=4):
@@ -139,6 +145,57 @@ def test_vqe_probe_caches_per_P(monkeypatch):
     grad_fn(params)
     grad_fn(params)
     assert len(probe_calls) == 1, f"probed {len(probe_calls)} times for same P"
+
+
+def test_vqe_auto_skips_probe_when_torch_tuned_is_one(monkeypatch):
+    """If the torch probe already returns 1, skip the JAX probe entirely
+    and cache chunk_size=1 directly. Covers the tiny-workload early path."""
+    model, P = _vqe_model(N=4, reps=1)
+    grad_fn = BatchParameterShiftGradient(
+        model, chunk_size="auto", backend="jax",
+    )
+    monkeypatch.setattr(grad_fn, "_resolve_chunk_size", lambda P_: 1)
+
+    probe_calls = []
+    monkeypatch.setattr(
+        grad_fn, "_probe_jax_chunk",
+        lambda P_, upper: probe_calls.append((P_, upper)) or 1,
+    )
+
+    grad_fn(jnp.asarray(np.zeros(P, dtype=np.float32)))
+    assert grad_fn._jax_probed_chunk[P] == 1
+    assert probe_calls == []  # probe must not have run
+
+
+def test_vqe_probe_reraises_non_oom_errors(monkeypatch):
+    """The probe must not swallow errors that aren't OOM — it's supposed
+    to binary-search on memory failures, not hide genuine bugs."""
+    model, P = _vqe_model(N=4, reps=1)
+    grad_fn = BatchParameterShiftGradient(
+        model, chunk_size="auto", backend="jax",
+    )
+
+    def fake_grad(params, P_, chunk, cache):
+        raise ValueError("something unrelated blew up")
+
+    monkeypatch.setattr(grad_fn, "_jax_grad_chunked", fake_grad)
+    monkeypatch.setattr(grad_fn, "_resolve_chunk_size", lambda P_: P_)
+
+    with pytest.raises(ValueError, match="unrelated"):
+        grad_fn._probe_jax_chunk(P, upper=P)
+
+
+def test_qml_probe_reraises_non_oom_errors(monkeypatch):
+    """QMLModel probe must re-raise non-OOM errors, same contract as VQE."""
+    model = _qml_model(n_qubits=3, n_layers=2)
+    N = 4
+
+    def fake_grad(X, theta, **kw):
+        raise ValueError("unrelated bug")
+
+    monkeypatch.setattr(model, "parameter_shift_grad", fake_grad)
+    with pytest.raises(ValueError, match="unrelated"):
+        model._probe_jax_ps_chunk(N, upper=model.n_trainable)
 
 
 def test_vqe_probe_fakes_oom_returns_safe_cap(monkeypatch):
