@@ -47,6 +47,11 @@ class QMLModel:
             - ``"jax"``: always the JIT JAX path. Torch inputs are
               converted to jax for compute; outputs are converted back to
               torch so the return type still matches the input type.
+        max_ps_chunk: Optional ceiling on the parameter-shift chunk size.
+            ``auto_tune`` will cap its tuned value at this number. Useful
+            when you already know the ceiling for your hardware (e.g. a
+            Colab A100 that OOMs at `_ps_chunk > 8`), letting you skip
+            the per-session probe entirely. Default: no ceiling.
     """
 
     def __init__(
@@ -59,6 +64,7 @@ class QMLModel:
         dtype: torch.dtype = torch.cfloat,
         batch_size: int | None = None,
         backend: str | None = None,
+        max_ps_chunk: int | None = None,
     ):
         self.n_qubits = circuit.num_qubits
         self.rank = rank
@@ -89,6 +95,12 @@ class QMLModel:
             )
         self._backend_arg = backend
         self._jax_jit_cache: dict = {}
+
+        if max_ps_chunk is not None and max_ps_chunk < 1:
+            raise ValueError(
+                f"max_ps_chunk must be >= 1 if set, got {max_ps_chunk!r}"
+            )
+        self._max_ps_chunk = max_ps_chunk
 
         # Per-qubit Z Hamiltonians
         # Qiskit little-endian: qubit q = position q from the right
@@ -151,6 +163,20 @@ class QMLModel:
         # Each param-shift chunk processes 2 * chunk * N samples.
         # Max chunk = batch_size // (2 * N), clamped to [1, n_trainable].
         ps_chunk = max(1, min(self.batch_size // (2 * N), self.n_trainable))
+
+        # Step 3 (JAX only): the torch probe above measures a different
+        # kernel than the JAX gradient uses. XLA pre-allocates during
+        # compile and the fused `(2·chunk·N, total_slots)` → measure
+        # intermediate usually OOMs at a smaller chunk than the torch
+        # probe's 85% memory fit suggests. Refine with a real JAX JIT
+        # probe — binary search on "did compile + first run succeed?"
+        if _resolve_backend_pref(self._backend_arg) == "jax" and ps_chunk > 1:
+            ps_chunk = self._probe_jax_ps_chunk(N, upper=ps_chunk)
+
+        # User override: hard ceiling on ps_chunk regardless of probe.
+        if self._max_ps_chunk is not None:
+            ps_chunk = min(ps_chunk, self._max_ps_chunk)
+
         self._ps_chunk_cache = {N: ps_chunk}
 
         n_chunks = math.ceil(self.n_trainable / ps_chunk)
@@ -474,6 +500,59 @@ class QMLModel:
         train_idx = jnp.asarray(self._trainable_indices, dtype=jnp.int32)
         self._jax_index_cache = (data_idx, feat_idx, train_idx)
         return self._jax_index_cache
+
+    def _probe_jax_ps_chunk(self, N: int, upper: int) -> int:
+        """Binary-search the largest JAX parameter-shift chunk that
+        compiles + runs without OOM on the current device.
+
+        Probes the **same** code path training will hit. Safer than
+        reusing the torch-probed `batch_size // (2 * N)` value, which
+        underestimates JAX/XLA's per-call memory footprint.
+
+        ``upper`` caps the search (usually the torch-tuned chunk value).
+        Returns a chunk in [1, upper] with a 0.75 safety factor baked
+        in. Side effect: clears ``self._jax_jit_cache`` — probe-only
+        compilations would otherwise pin memory across the search.
+        """
+        import jax.numpy as jnp
+        import numpy as np
+
+        from .optimization.auto_batch import jit_chunk_binary_search
+
+        # Any stale compiled kernels from earlier calls/probes can pin
+        # HBM; clear before we start.
+        self._jax_jit_cache.clear()
+
+        X_dummy = jnp.zeros((N, self.n_qubits), dtype=jnp.float32)
+        theta_dummy = jnp.zeros((self.n_trainable,), dtype=jnp.float32)
+
+        def _try(chunk: int) -> bool:
+            # Each probe gets a fresh cache so memory from previous
+            # candidates doesn't bias the next attempt.
+            self._jax_jit_cache.clear()
+            self._ps_chunk_cache = {N: chunk}
+            try:
+                self.parameter_shift_grad(X_dummy, theta_dummy)
+                return True
+            except Exception as e:  # XlaRuntimeError etc.
+                msg = str(e)
+                oom = (
+                    "RESOURCE_EXHAUSTED" in msg
+                    or "Out of memory" in msg
+                    or "No valid config" in msg
+                    or "out of memory" in msg.lower()
+                )
+                if oom:
+                    self._jax_jit_cache.clear()
+                    return False
+                raise  # unrelated error — don't silently swallow
+
+        found = jit_chunk_binary_search(_try, upper=upper, safety_frac=0.75)
+
+        # Free probe-time compilations so training starts with a clean
+        # cache and a single well-sized kernel gets compiled lazily.
+        self._jax_jit_cache.clear()
+        return found
 
     def _forward_jax(self, X, theta, *, theta_is_jax: bool):
         import jax

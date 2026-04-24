@@ -146,13 +146,17 @@ fix is to chunk the work.
 # Explicit chunk — process at most 8 params per kernel
 grad_fn = BatchParameterShiftGradient(model, chunk_size=8, backend="jax")
 
-# Auto (probes GPU via the torch helper, conservative for JAX)
+# Auto-tune: probes the *real* JAX kernel to find the largest chunk
+# that compiles + runs without OOM. First call takes ~10-20 s extra
+# (the probe); subsequent calls are cached per P.
 grad_fn = BatchParameterShiftGradient(model, chunk_size="auto", backend="jax")
-```
 
-Rule of thumb: if you OOM with `chunk_size=None` (default, single
-graph), halve until it fits. Typical safe values for χ=12, N=20 on a
-16 GB GPU: `chunk_size=16`.
+# Hard ceiling — auto-tune result is clamped. Useful when you already
+# know your hardware's limit (e.g. Colab A100 that OOMs at chunk > 8).
+grad_fn = BatchParameterShiftGradient(
+    model, chunk_size="auto", max_chunk_size=8, backend="jax"
+)
+```
 
 ### `QMLModel`
 
@@ -162,15 +166,133 @@ Two knobs:
 qml = QMLModel(circuit, di, ti, rank=8, backend="jax",
                batch_size=64)   # cap on data samples per forward chunk
 
-# Gradient also chunks over trainable params — shares the torch-tuned
-# value; call auto_tune once to populate it:
-qml.auto_tune(N_train)        # torch-based probe; value reused by JAX path
+qml.auto_tune(N_train)        # torch + JAX refinement; ~10-20 s first call
 grad = qml.parameter_shift_grad(X_train, theta)
 ```
 
-If the QML gradient still OOMs with `auto_tune` output, reduce
-`batch_size` further — it feeds into the inner
-`measure_all_qubits_jax` block which is the main memory consumer.
+`auto_tune` runs a two-stage probe when `backend="jax"`:
+
+1. **Torch probe** (existing) — sets `batch_size` and an initial
+   `_ps_chunk` from the torch forward kernel's memory fit.
+2. **JAX refinement** (new) — runs the real
+   `parameter_shift_grad_jax` at shrinking chunk sizes until compile
+   + execution succeed, then applies a 0.75 safety factor. Caches
+   the result per training-set size `N`.
+
+If you already know your hardware's ceiling, pass `max_ps_chunk=K` to
+the constructor to skip the JAX refinement entirely:
+
+```python
+qml = QMLModel(circuit, di, ti, rank=8, backend="jax", max_ps_chunk=8)
+qml.auto_tune(N_train)   # still runs torch probe for batch_size,
+                         # but clamps _ps_chunk at 8 without probing.
+```
+
+---
+
+## How to: OOM-safe JAX training loops
+
+End-to-end recipes for the two common setups. Both assume you've
+already enabled the compile cache once at the top of your session
+(`enable_compilation_cache(...)`) and installed `jax[cuda12]` /
+`jax[tpu]` as appropriate.
+
+### VQE: `TensorRingModel` + `BatchParameterShiftGradient`
+
+```python
+import torch
+from qiskit_trev.model import TensorRingModel
+from qiskit_trev.gradient import BatchParameterShiftGradient
+
+model = TensorRingModel(qc, observable, rank=12, device="cuda")
+
+# JAX backend + auto-tune = safe on any GPU. First call to grad_fn pays
+# ~10–30 s for the probe (once per P); every subsequent call is cached.
+grad_fn = BatchParameterShiftGradient(
+    model,
+    shift=torch.pi / 2,
+    chunk_size="auto",    # probe finds a safe chunk
+    backend="jax",
+)
+
+params = torch.rand(model.num_params) * 2 * torch.pi
+lr = 0.01
+
+for step in range(500):
+    g = grad_fn(params)             # torch → jax → torch, auto-chunked
+    params = params - lr * g
+```
+
+**If you already know the ceiling** (e.g. Colab A100 OOMs above
+`chunk=8` on your circuit):
+
+```python
+grad_fn = BatchParameterShiftGradient(
+    model,
+    chunk_size="auto",
+    max_chunk_size=8,     # hard cap — skip probing entirely if you want
+    backend="jax",
+)
+```
+
+### QML: `QMLModel.parameter_shift_grad`
+
+```python
+from qiskit_trev.qml import QMLModel
+
+qml = QMLModel(
+    circuit, data_indices, trainable_indices,
+    rank=12, device="cuda", backend="jax",
+    # Omit max_ps_chunk to let the probe find the right value on its own.
+    # Pass max_ps_chunk=K if you already know your ceiling.
+)
+
+# One-time calibration. When backend="jax", this runs a torch probe for
+# forward batch_size AND a JAX probe for gradient _ps_chunk. Plan on
+# 20–60 s for the first call on an A100.
+qml.auto_tune(len(X_train))
+
+for epoch in range(num_epochs):
+    for X_batch, y_batch in loader:
+        g = qml.parameter_shift_grad(X_batch, theta)   # (Q, P, B)
+        theta = theta - lr * reduce_over_qubits(g, y_batch, ...)
+```
+
+### What the probe actually does (and how long it takes)
+
+When `backend="jax"` and you ask for `chunk_size="auto"` /
+`auto_tune(...)`:
+
+1. The torch probe (unchanged) picks an optimistic upper bound based
+   on CUDA memory fit at 85%.
+2. A JAX-native probe runs the real JIT'd kernel at candidate chunk
+   sizes, binary-searching for the largest that compiles without
+   `RESOURCE_EXHAUSTED` or `No valid config found`.
+3. A **0.75 safety factor** is applied on top — training-time churn
+   from multiple shape compiles in flight and XLA cache growth can
+   push memory higher than the single-shot probe.
+4. The result is cached per `P` (for gradient) / per `N` (for QML),
+   so every subsequent call within the session skips the probe.
+
+Expected first-call cost on typical hardware:
+
+| Workload | GPU | First `auto_tune` |
+|---|---|---|
+| VQE, N=10, rank=10, P=20 | A100 40 GB | ~10 s |
+| QML, Q=8, N_train=500, P=20 | A100 40 GB | ~20 s |
+| QML, Q=16, N_train=500, P=130 | A100 40 GB | ~45 s |
+
+All subsequent calls are cached — the per-session probe cost
+disappears completely after the first gradient call.
+
+### Troubleshooting the probe
+
+| Symptom | Cause / fix |
+|---|---|
+| Probe takes longer than expected | The cache directory is probably not persistent. On Colab, point `enable_compilation_cache` at Google Drive. |
+| Probe returns `1` always | Even `chunk=1` can't compile — something's misconfigured (GPU too small for problem, or XLA plugin mismatch). Try `backend="torch"` to confirm the workload size itself is reasonable. |
+| Probe passes but training-time OOM | XLA's real-time memory use can exceed probe-time by a few % under cache churn. Add a ceiling: `max_chunk_size=probe_result // 2`. Or lower the `safety_frac` by monkey-patching the helper to `0.5`. |
+| Probe succeeds, first training call recompiles | Expected — probe clears its own compile to free memory. First real call compiles once, gets cached. |
 
 ---
 
@@ -224,7 +346,8 @@ When in doubt, compare to `backend="torch"` on a small problem first.
 | Symptom | Fix |
 |---|---|
 | First call takes forever | Enable `enable_compilation_cache()`. On Colab, mount Drive. |
-| `XlaRuntimeError: RESOURCE_EXHAUSTED` | Lower `chunk_size` (gradient) or `batch_size` (QMLModel). |
+| `XlaRuntimeError: RESOURCE_EXHAUSTED` | Use `chunk_size="auto"` / `auto_tune` — they probe the real JAX kernel. Pass `max_chunk_size=K` or `max_ps_chunk=K` if you know the ceiling. |
+| `No valid config found!` during compile | Same fix as RESOURCE_EXHAUSTED — XLA autotuner ran out of scratch; shrink the chunk. |
 | Numbers differ from torch by ~1e-4 | Expected — tf32 matmul. Use HIGHEST precision for bit-parity. |
 | `jax.devices()` shows CPU on GPU runtime | `pip install "jax[cuda12]"` — the default `pip install jax` is CPU-only. |
 | TPU runtime is slow | Yes. See above. Use GPU for this workload. |
