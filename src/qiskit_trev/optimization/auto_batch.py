@@ -1,6 +1,15 @@
 """Auto batch size tuning for GPU memory management.
 
 Ported from TREV optimization/gradients/set_batch_size.py.
+
+Contains two probes:
+
+- :func:`auto_batch_size` — torch-side: probes peak GPU memory via
+  ``torch.cuda.max_memory_allocated``. Fits by memory fraction.
+- :func:`jit_chunk_binary_search` — framework-agnostic: binary-searches
+  on a boolean "did this compile/run?" callback. Use for JAX JIT paths
+  where memory isn't directly observable from Python (XLA pre-allocates
+  during compile and OOMs at compile time rather than gradually).
 """
 
 from __future__ import annotations
@@ -113,3 +122,51 @@ def auto_batch_size(
             hi = mid
 
     return lo
+
+
+def jit_chunk_binary_search(
+    try_fn: Callable[[int], bool],
+    upper: int,
+    *,
+    lower: int = 1,
+    safety_frac: float = 0.75,
+) -> int:
+    """Binary-search the largest chunk size a JIT'd kernel can handle.
+
+    ``try_fn(chunk)`` must return True if a probe run at ``chunk``
+    succeeded (compile + first execution both OK), False if it OOM'd or
+    otherwise failed. The caller is responsible for catching the right
+    exceptions — this helper only sees booleans.
+
+    Unlike :func:`auto_batch_size`, this probe does not inspect memory.
+    It only counts pass/fail per candidate, which is the only signal
+    available for JAX/XLA where allocation happens during compile.
+
+    Returns ``floor(largest_passing * safety_frac)``, clamped to
+    ``[lower, upper]``. The safety factor guards against XLA cache
+    churn and multi-shape concurrency at training time.
+    """
+    assert lower >= 1 and upper >= lower, (lower, upper)
+
+    if upper == lower:
+        return lower if try_fn(lower) else lower
+
+    # Quick top-out check: if upper works, no search needed.
+    if try_fn(upper):
+        return max(lower, int(upper * safety_frac))
+
+    # Quick bottom check: if even `lower` fails, caller will still get
+    # `lower` back — they can decide whether to error or persist.
+    if not try_fn(lower):
+        return lower
+
+    # Invariant: try_fn(lo) passed, try_fn(hi) failed, lo < hi.
+    lo, hi = lower, upper
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if try_fn(mid):
+            lo = mid
+        else:
+            hi = mid
+
+    return max(lower, int(lo * safety_frac))

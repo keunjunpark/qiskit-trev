@@ -141,6 +141,10 @@ class BatchParameterShiftGradient:
             - ``"jax"``: always run the JIT-compiled JAX path, converting
               torch inputs over. The return type matches the input type, so
               drop-in use in torch training loops works unchanged.
+        max_chunk_size: Optional ceiling on the gradient chunk size. When
+            ``chunk_size="auto"`` the probe's result is clamped at this
+            value. Useful when you already know your hardware's ceiling
+            (e.g. a Colab A100 that OOMs at ``chunk > 8``).
     """
 
     def __init__(
@@ -150,6 +154,7 @@ class BatchParameterShiftGradient:
         chunk_size: int | str | None = None,
         num_gpus: int | None = None,
         backend: str | None = None,
+        max_chunk_size: int | None = None,
     ):
         self._model = model
         self._shift = shift
@@ -164,6 +169,15 @@ class BatchParameterShiftGradient:
                 f"backend must be one of {_VALID_BACKENDS}, got {backend!r}"
             )
         self._backend_arg = backend
+
+        if max_chunk_size is not None and max_chunk_size < 1:
+            raise ValueError(
+                f"max_chunk_size must be >= 1 if set, got {max_chunk_size!r}"
+            )
+        self._max_chunk_size = max_chunk_size
+        # Per-P cache of JAX-probed chunk sizes — probe once per P, reuse.
+        self._jax_probed_chunk: dict[int, int] = {}
+        self._jax_jit_cache: dict = {}
 
     def _resolve_chunk_size(self, P: int) -> int:
         """Resolve chunk_size, potentially using auto-tuning."""
@@ -371,29 +385,75 @@ class BatchParameterShiftGradient:
         model = self._model
         shift = self._shift
 
-        cache = getattr(self, "_jax_jit_cache", None)
-        if cache is None:
-            cache = {}
-            self._jax_jit_cache = cache
+        cache = self._jax_jit_cache
 
         # Respect the chunk_size knob so the JAX path shares OOM-handling
-        # discipline with the torch path. Current torch `auto` probes GPU
-        # memory with a torch kernel — the number is a conservative
-        # estimate for JAX (XLA usually allocates a bit more), but it's
-        # the right order of magnitude. If user sets chunk_size=None we
-        # keep the old "all at once" behaviour.
+        # discipline with the torch path.
         setting = self._chunk_size_setting
         if isinstance(setting, int):
             chunk_size = min(setting, P)
         elif setting == "auto":
-            chunk_size = min(self._resolve_chunk_size(P), P)
+            # Torch probe gives an optimistic upper bound; JAX kernel has
+            # a larger memory footprint, so refine with a JAX-native
+            # probe. Cache per P so we probe once per session.
+            torch_tuned = min(self._resolve_chunk_size(P), P)
+            if P in self._jax_probed_chunk:
+                chunk_size = self._jax_probed_chunk[P]
+            elif torch_tuned <= 1:
+                chunk_size = 1
+                self._jax_probed_chunk[P] = 1
+            else:
+                chunk_size = self._probe_jax_chunk(P, upper=torch_tuned)
+                self._jax_probed_chunk[P] = chunk_size
         else:
             chunk_size = P
+
+        # Hard ceiling from user override.
+        if self._max_chunk_size is not None:
+            chunk_size = min(chunk_size, self._max_chunk_size)
 
         if chunk_size >= P:
             return self._jax_grad_single_shot(params, P, cache).block_until_ready()
 
         return self._jax_grad_chunked(params, P, chunk_size, cache).block_until_ready()
+
+    def _probe_jax_chunk(self, P: int, upper: int) -> int:
+        """Binary-search the largest gradient chunk that compiles + runs
+        without OOM on the current JAX device.
+
+        Probes the same ``_jax_grad_chunked`` kernel training uses.
+        Returns a chunk in ``[1, upper]`` with a 0.75 safety factor.
+        """
+        import jax.numpy as jnp
+
+        from .optimization.auto_batch import jit_chunk_binary_search
+
+        self._jax_jit_cache.clear()
+        dummy = jnp.zeros((P,), dtype=jnp.float32)
+
+        def _try(chunk: int) -> bool:
+            self._jax_jit_cache.clear()
+            try:
+                self._jax_grad_chunked(
+                    dummy, P, chunk, self._jax_jit_cache
+                ).block_until_ready()
+                return True
+            except Exception as e:  # XlaRuntimeError or similar
+                msg = str(e)
+                oom = (
+                    "RESOURCE_EXHAUSTED" in msg
+                    or "Out of memory" in msg
+                    or "out of memory" in msg.lower()
+                    or "No valid config" in msg
+                )
+                if oom:
+                    self._jax_jit_cache.clear()
+                    return False
+                raise
+
+        found = jit_chunk_binary_search(_try, upper=upper, safety_frac=0.75)
+        self._jax_jit_cache.clear()
+        return found
 
     def _jax_grad_constants(self):
         """Cache the per-model JAX constants (paulis, Z/I, coeffs).
