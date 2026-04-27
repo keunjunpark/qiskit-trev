@@ -42,9 +42,9 @@ def test_resolve_pref_env_wins_when_no_arg(monkeypatch):
     assert _resolve_backend_pref(None) == "jax"
 
 
-def test_resolve_pref_env_default_is_auto(monkeypatch):
+def test_resolve_pref_env_default_is_torch(monkeypatch):
     monkeypatch.delenv("QISKIT_TREV_BACKEND", raising=False)
-    assert _resolve_backend_pref(None) == "auto"
+    assert _resolve_backend_pref(None) == "torch"
 
 
 def test_resolve_pref_env_case_insensitive(monkeypatch):
@@ -55,7 +55,7 @@ def test_resolve_pref_env_case_insensitive(monkeypatch):
 def test_resolve_pref_invalid_env_warns(monkeypatch):
     monkeypatch.setenv("QISKIT_TREV_BACKEND", "bogus")
     with pytest.warns(RuntimeWarning, match="QISKIT_TREV_BACKEND"):
-        assert _resolve_backend_pref(None) == "auto"
+        assert _resolve_backend_pref(None) == "torch"
 
 
 def test_constructor_rejects_invalid_backend():
@@ -98,16 +98,32 @@ def test_force_torch_on_jax_input_returns_jax():
     assert g.shape == (P,)
 
 
-def test_auto_preserves_existing_behavior():
-    """backend=None with no env var = 'auto' = dispatch by input type."""
+def test_default_is_torch(monkeypatch):
+    """backend=None with no env var resolves to 'torch'. JAX is opt-in."""
+    monkeypatch.delenv("QISKIT_TREV_BACKEND", raising=False)
     model, P = _tiny_model(N=4, reps=1, rank=4)
     grad_fn = BatchParameterShiftGradient(model)  # backend defaults to None
 
-    # torch input → torch output
+    assert _resolve_backend_pref(grad_fn._backend_arg) == "torch"
+
+    # torch input runs the torch path naturally.
     g_t = grad_fn(torch.rand(P) * 6.28)
     assert isinstance(g_t, torch.Tensor)
 
-    # jax input → jax output
+    # jax input: torch path runs the compute, but return type still
+    # mirrors the input type (existing convention, see test_force_torch_*).
+    g_j = grad_fn(jnp.asarray(np.random.rand(P).astype(np.float32) * 6.28))
+    assert type(g_j).__module__.startswith(("jax", "jaxlib"))
+
+
+def test_explicit_auto_dispatches_by_input_type():
+    """backend='auto' still dispatches by input type for users who opt in."""
+    model, P = _tiny_model(N=4, reps=1, rank=4)
+    grad_fn = BatchParameterShiftGradient(model, backend="auto")
+
+    g_t = grad_fn(torch.rand(P) * 6.28)
+    assert isinstance(g_t, torch.Tensor)
+
     g_j = grad_fn(jnp.asarray(np.random.rand(P).astype(np.float32) * 6.28))
     assert type(g_j).__module__.startswith(("jax", "jaxlib"))
 

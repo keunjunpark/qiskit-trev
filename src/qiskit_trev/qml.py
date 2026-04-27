@@ -40,7 +40,8 @@ class QMLModel:
         backend: Force a compute backend.
 
             - ``None`` (default): honour ``QISKIT_TREV_BACKEND`` env var, or
-              ``"auto"`` if unset.
+              ``"torch"`` if unset. The JAX backend is opt-in while it
+              stabilises — pass ``"jax"`` (or ``"auto"``) to use it.
             - ``"auto"``: dispatch by ``theta`` type — torch → torch path,
               jax.Array → jitted JAX path.
             - ``"torch"``: always torch.

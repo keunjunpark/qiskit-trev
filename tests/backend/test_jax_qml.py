@@ -81,7 +81,7 @@ def test_forward_env_var_forces_jax(monkeypatch):
 def test_forward_jax_array_input_returns_jax():
     """Passing a jax.Array for theta gets a jax.Array back (auto dispatch)."""
     qc, di, ti = _make_circuit(3, 1)
-    model = QMLModel(qc, di, ti, rank=4, device="cpu")
+    model = QMLModel(qc, di, ti, rank=4, device="cpu", backend="auto")
 
     X_j = jnp.asarray(_xy(4, 3).numpy())
     theta_j = jnp.asarray(_theta(len(ti)).numpy())

@@ -94,8 +94,11 @@ def _resolve_backend_pref(backend_arg: str | None) -> str:
     """Resolve the backend preference for a gradient call.
 
     Precedence: explicit constructor arg > ``QISKIT_TREV_BACKEND`` env
-    var > ``"auto"``. The env var is read on each gradient call (cheap,
+    var > ``"torch"``. The env var is read on each gradient call (cheap,
     and lets notebooks override without rebuilding objects).
+
+    Default is ``"torch"`` (the JAX backend is opt-in while it stabilises;
+    pass ``backend="jax"`` or set ``QISKIT_TREV_BACKEND=jax`` to use it).
     """
     import os
     import warnings
@@ -106,15 +109,15 @@ def _resolve_backend_pref(backend_arg: str | None) -> str:
                 f"backend must be one of {_VALID_BACKENDS}, got {backend_arg!r}"
             )
         return backend_arg
-    env = os.environ.get("QISKIT_TREV_BACKEND", "auto").lower()
+    env = os.environ.get("QISKIT_TREV_BACKEND", "torch").lower()
     if env not in _VALID_BACKENDS:
         warnings.warn(
             f"QISKIT_TREV_BACKEND={env!r} not in {_VALID_BACKENDS}; "
-            "falling back to 'auto'",
+            "falling back to 'torch'",
             RuntimeWarning,
             stacklevel=2,
         )
-        return "auto"
+        return "torch"
     return env
 
 
@@ -141,7 +144,8 @@ class BatchParameterShiftGradient:
         backend: Force a compute backend.
 
             - ``None`` (default): honour the ``QISKIT_TREV_BACKEND`` env var, or
-              ``"auto"`` if unset.
+              ``"torch"`` if unset. The JAX backend is opt-in while it
+              stabilises — set this to ``"jax"`` (or ``"auto"``) to use it.
             - ``"auto"``: dispatch based on the type of ``params`` at call time —
               ``torch.Tensor`` runs the torch path, ``jax.Array`` runs the
               JIT-compiled JAX path.

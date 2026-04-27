@@ -5,6 +5,14 @@ PyTorch one. On a modern NVIDIA GPU the JAX path is **2–9× faster per
 gradient step** than PyTorch after warm-up, and wins wall-clock on
 training runs of roughly **100 iterations or more**.
 
+> **Status: experimental, opt-in.** As of v0.2.2 the default backend is
+> `"torch"`. To use JAX you must explicitly select it — pass
+> `backend="jax"` (or `backend="auto"` for type dispatch) on
+> `BatchParameterShiftGradient` / `QMLModel`, or set
+> `QISKIT_TREV_BACKEND=jax` in the environment. The JAX path is still
+> stabilising; rough edges are most likely to show up in chunk-size
+> auto-tuning and on TPU.
+
 This tutorial covers: when to use it, how to turn it on, how to make the
 cold-start bearable, and how to keep it out of trouble on big workloads.
 
@@ -67,10 +75,11 @@ grad_fn = BatchParameterShiftGradient(model)   # honours env var
 ```
 
 ```python
-# 3. Pass JAX arrays directly (dispatch = "auto", the default)
+# 3. Type dispatch (opt-in via backend="auto") — JAX arrays trigger the
+#    JAX path, torch tensors trigger the torch path.
 import jax.numpy as jnp
 
-grad_fn = BatchParameterShiftGradient(model)
+grad_fn = BatchParameterShiftGradient(model, backend="auto")
 g = grad_fn(jnp.asarray(my_params))   # runs JAX path, returns jax.Array
 ```
 

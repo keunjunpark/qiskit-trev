@@ -310,7 +310,7 @@ def test_qml_analytical_estimator_is_bounded():
 def test_qml_probe_fakes_oom_returns_safe_cap(monkeypatch):
     """Mock parameter_shift_grad to raise on chunk > K, verify probe
     lands at int(K * 0.75)."""
-    model = _qml_model(n_qubits=3, n_layers=2)  # n_trainable = 6
+    model = _qml_model(n_qubits=3, n_layers=2, backend="jax")  # n_trainable = 6
     N = 4
 
     cap = 4
