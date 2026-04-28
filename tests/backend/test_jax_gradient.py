@@ -103,7 +103,7 @@ def test_chunked_jax_gradient_matches_unchunked(chunk_size):
 def test_gradient_jit_cache_hits_on_same_shape():
     """Second call with same-shape params reuses the compiled kernel."""
     model, P = _build_model(4, 1, 4)
-    grad_fn = BatchParameterShiftGradient(model)
+    grad_fn = BatchParameterShiftGradient(model, backend="jax")
 
     p1 = jnp.asarray(np.random.RandomState(0).rand(P).astype(np.float32))
     p2 = jnp.asarray(np.random.RandomState(1).rand(P).astype(np.float32))

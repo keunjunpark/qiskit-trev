@@ -5,6 +5,14 @@ PyTorch one. On a modern NVIDIA GPU the JAX path is **2–9× faster per
 gradient step** than PyTorch after warm-up, and wins wall-clock on
 training runs of roughly **100 iterations or more**.
 
+> **Status: experimental, opt-in.** As of v0.2.2 the default backend is
+> `"torch"`. To use JAX you must explicitly select it — pass
+> `backend="jax"` (or `backend="auto"` for type dispatch) on
+> `BatchParameterShiftGradient` / `QMLModel`, or set
+> `QISKIT_TREV_BACKEND=jax` in the environment. The JAX path is still
+> stabilising; rough edges are most likely to show up in chunk-size
+> auto-tuning and on TPU.
+
 This tutorial covers: when to use it, how to turn it on, how to make the
 cold-start bearable, and how to keep it out of trouble on big workloads.
 
@@ -67,10 +75,11 @@ grad_fn = BatchParameterShiftGradient(model)   # honours env var
 ```
 
 ```python
-# 3. Pass JAX arrays directly (dispatch = "auto", the default)
+# 3. Type dispatch (opt-in via backend="auto") — JAX arrays trigger the
+#    JAX path, torch tensors trigger the torch path.
 import jax.numpy as jnp
 
-grad_fn = BatchParameterShiftGradient(model)
+grad_fn = BatchParameterShiftGradient(model, backend="auto")
 g = grad_fn(jnp.asarray(my_params))   # runs JAX path, returns jax.Array
 ```
 
@@ -140,53 +149,75 @@ JAX pre-allocates intermediates when it compiles, so an out-of-memory
 failure happens at compile-or-first-run time rather than gradually. The
 fix is to chunk the work.
 
+Three regimes for picking the chunk — from **fastest setup** to **most
+memory-optimal**:
+
+| Regime | Setup cost | When to use |
+|---|---|---|
+| Trust-me: `max_*` override | ~0 s | You already know your hardware's ceiling |
+| Analytical estimate (default) | ~0 s | You don't, but don't want to wait |
+| JIT probe (opt-in) | 30–600 s cold | You want the absolute largest chunk that fits |
+
 ### `BatchParameterShiftGradient`
 
 ```python
-# Explicit chunk — process at most 8 params per kernel
+# Explicit int — no probe, no estimator, no auto-tune. Fast.
 grad_fn = BatchParameterShiftGradient(model, chunk_size=8, backend="jax")
 
-# Auto-tune: probes the *real* JAX kernel to find the largest chunk
-# that compiles + runs without OOM. First call takes ~10-20 s extra
-# (the probe); subsequent calls are cached per P.
+# Analytical default (recommended): closed-form memory estimate from
+# problem params. ~instant; never OOMs at autotune_level <= 2.
 grad_fn = BatchParameterShiftGradient(model, chunk_size="auto", backend="jax")
 
-# Hard ceiling — auto-tune result is clamped. Useful when you already
-# know your hardware's limit (e.g. Colab A100 that OOMs at chunk > 8).
+# Hard ceiling — short-circuits everything. Use when you've already
+# diagnosed the ceiling on your hardware.
 grad_fn = BatchParameterShiftGradient(
-    model, chunk_size="auto", max_chunk_size=8, backend="jax"
+    model, chunk_size="auto", max_chunk_size=8, backend="jax",
 )
+
+# Opt-in binary-search probe (old behaviour). Runs 5–8 real compiles
+# before the first training step — can take 30–600 s cold. Max memory
+# utilisation at the cost of setup time.
+grad_fn = BatchParameterShiftGradient(model, chunk_size="jit", backend="jax")
 ```
 
 ### `QMLModel`
 
-Two knobs:
-
 ```python
 qml = QMLModel(circuit, di, ti, rank=8, backend="jax",
-               batch_size=64)   # cap on data samples per forward chunk
+               batch_size=64)          # cap on data samples per forward chunk
 
-qml.auto_tune(N_train)        # torch + JAX refinement; ~10-20 s first call
+# Default analytical path — instant.
+qml.auto_tune(N_train)
+
+# Known ceiling — short-circuit all probing.
+qml = QMLModel(circuit, di, ti, rank=8, backend="jax", max_ps_chunk=8)
+qml.auto_tune(N_train)                 # skips analytical AND jit, uses 8 directly
+
+# Old binary-search probe as explicit opt-in.
+qml.auto_tune(N_train, probe="jit")    # 30 s–10 min, most accurate
+
+# Skip JAX-specific refinement entirely, trust the torch probe.
+qml.auto_tune(N_train, probe="none")
+
 grad = qml.parameter_shift_grad(X_train, theta)
 ```
 
-`auto_tune` runs a two-stage probe when `backend="jax"`:
+**What the analytical estimator does:** computes the closed-form size
+of the ``(Q, 2·chunk·N, χ⁴)`` float32 intermediate inside the JAX
+gradient kernel, accounts for XLA double-buffering, applies a 5× slack
+for moderate autotune scratch, and divides into available HBM. No JAX
+compile runs. Calibrated against T4 / A100 / A100-80 probe data; safe
+at ``xla_gpu_autotune_level <= 2`` (which `enable_compilation_cache()`
+configures).
 
-1. **Torch probe** (existing) — sets `batch_size` and an initial
-   `_ps_chunk` from the torch forward kernel's memory fit.
-2. **JAX refinement** (new) — runs the real
-   `parameter_shift_grad_jax` at shrinking chunk sizes until compile
-   + execution succeed, then applies a 0.75 safety factor. Caches
-   the result per training-set size `N`.
+**If you're seeing OOM with the analytical estimator**, either your
+autotune level is at the XLA default (4) or XLA is holding memory from
+a previous session. Fix by either:
 
-If you already know your hardware's ceiling, pass `max_ps_chunk=K` to
-the constructor to skip the JAX refinement entirely:
-
-```python
-qml = QMLModel(circuit, di, ti, rank=8, backend="jax", max_ps_chunk=8)
-qml.auto_tune(N_train)   # still runs torch probe for batch_size,
-                         # but clamps _ps_chunk at 8 without probing.
-```
+1. Calling `enable_compilation_cache()` at process start — sets
+   autotune_level=2 and gives the estimator an accurate memory model.
+2. Passing `max_ps_chunk=K` / `max_chunk_size=K` with a known-safe
+   value (halving the analytical estimate is a safe first guess).
 
 ---
 
