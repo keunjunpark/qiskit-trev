@@ -282,29 +282,31 @@ def test_qml_auto_tune_rejects_invalid_probe():
         model.auto_tune(4, probe="bogus")
 
 
-def test_qml_analytical_estimator_is_bounded():
+def test_qml_analytical_estimator_is_bounded(monkeypatch):
     """Analytical estimator must return a chunk in [1, n_trainable]
     regardless of how free GPU memory is reported. We can't probe real
-    CUDA on the CPU CI, but we can force-call the helper with a mocked
-    mem_get_info."""
+    CUDA on the CPU CI, so fake the device to CUDA and stub the memory
+    query."""
     model = _qml_model(n_qubits=3, n_layers=2)
-
-    # Stub torch.cuda.mem_get_info so the helper works without CUDA.
-    class _FakeCuda:
-        @staticmethod
-        def mem_get_info(device=None):
-            return (40 * 1024 ** 3, 40 * 1024 ** 3)  # 40 GB free
-    fake_torch_cuda = _FakeCuda()
+    model.device = "cuda"  # force the CUDA branch
 
     import qiskit_trev.qml as qml_mod
-    orig = qml_mod.torch.cuda.mem_get_info
-    qml_mod.torch.cuda.mem_get_info = fake_torch_cuda.mem_get_info
-    try:
-        result = model._analytical_ps_chunk(N=50)
-    finally:
-        qml_mod.torch.cuda.mem_get_info = orig
 
+    monkeypatch.setattr(qml_mod.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        qml_mod.torch.cuda,
+        "mem_get_info",
+        lambda device=None: (40 * 1024 ** 3, 40 * 1024 ** 3),
+    )
+
+    result = model._analytical_ps_chunk(N=50)
     assert 1 <= result <= model.n_trainable
+
+
+def test_qml_analytical_estimator_cpu_fallback():
+    """On CPU, analytical estimator skips VRAM math and returns n_trainable."""
+    model = _qml_model(n_qubits=3, n_layers=2)  # device defaults to cpu
+    assert model._analytical_ps_chunk(N=50) == model.n_trainable
 
 
 def test_qml_probe_fakes_oom_returns_safe_cap(monkeypatch):

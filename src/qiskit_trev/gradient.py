@@ -463,6 +463,10 @@ class BatchParameterShiftGradient:
         Pair with :func:`qiskit_trev.backend.enable_compilation_cache`,
         which sets ``autotune_level=2``, or pass ``max_chunk_size=K``.
         """
+        if not torch.cuda.is_available():
+            # CPU has no analogous VRAM ceiling for this estimator — chunking
+            # is purely a GPU-memory concern. Fall through with no constraint.
+            return max(1, upper)
         ham = self._model._hamiltonian
         C = max(1, len(ham.coefficients))
         chi = self._model.rank

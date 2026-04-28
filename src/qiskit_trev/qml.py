@@ -244,6 +244,9 @@ class QMLModel:
             \\text{max\\_chunk} = \\frac{\\text{free\\_bytes} \\cdot 0.85}
                                        {Q \\cdot 2 \\cdot N \\cdot \\chi^4 \\cdot 4 \\cdot 5}
         """
+        if self.device != "cuda" or not torch.cuda.is_available():
+            # No VRAM ceiling to model on CPU — fall through unbounded.
+            return max(1, self.n_trainable)
         free_b, _ = torch.cuda.mem_get_info(torch.device(self.device))
         Q, chi = self.n_qubits, self.rank
         bytes_per_elem = 4     # float32 intermediates
