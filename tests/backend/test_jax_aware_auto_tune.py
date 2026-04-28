@@ -180,6 +180,84 @@ def test_vqe_auto_skips_probe_when_torch_tuned_is_one(monkeypatch):
     assert probe_calls == []  # probe must not have run
 
 
+def test_vqe_int_chunk_size_skips_all_probes(monkeypatch):
+    """Explicit int chunk_size goes straight through — no analytical, no JIT."""
+    model, P = _vqe_model(N=4, reps=1)
+    grad_fn = BatchParameterShiftGradient(model, chunk_size=2, backend="jax")
+
+    analytic_calls = []
+    monkeypatch.setattr(
+        grad_fn, "_analytical_chunk",
+        lambda *a, **k: analytic_calls.append(a) or 1,
+    )
+    probe_calls = []
+    monkeypatch.setattr(
+        grad_fn, "_probe_jax_chunk",
+        lambda *a, **k: probe_calls.append(a) or 1,
+    )
+
+    grad_fn(jnp.asarray(np.zeros(P, dtype=np.float32)))
+    assert analytic_calls == []
+    assert probe_calls == []
+
+
+def test_vqe_auto_caches_per_P(monkeypatch):
+    """Second call with same P hits the analytical cache instead of recomputing."""
+    model, P = _vqe_model(N=4, reps=1)
+    grad_fn = BatchParameterShiftGradient(model, chunk_size="auto", backend="jax")
+
+    analytic_calls = []
+    real = grad_fn._analytical_chunk
+
+    def counting(P_, upper):
+        analytic_calls.append(P_)
+        return real(P_, upper)
+
+    monkeypatch.setattr(grad_fn, "_analytical_chunk", counting)
+
+    params = jnp.asarray(np.zeros(P, dtype=np.float32))
+    grad_fn(params)
+    grad_fn(params)
+    grad_fn(params)
+    assert len(analytic_calls) == 1, f"analytical ran {len(analytic_calls)} times"
+    assert P in grad_fn._jax_probed_chunk
+
+
+def test_vqe_jit_max_chunk_size_short_circuits(monkeypatch):
+    """chunk_size='jit' + max_chunk_size must skip the JIT probe entirely."""
+    model, P = _vqe_model(N=4, reps=1)
+    grad_fn = BatchParameterShiftGradient(
+        model, chunk_size="jit", max_chunk_size=2, backend="jax",
+    )
+
+    probe_calls = []
+    monkeypatch.setattr(
+        grad_fn, "_probe_jax_chunk",
+        lambda *a, **k: probe_calls.append(a) or 99,
+    )
+
+    grad_fn(jnp.asarray(np.zeros(P, dtype=np.float32)))
+    assert probe_calls == []
+
+
+def test_vqe_analytical_chunk_cuda_branch(monkeypatch):
+    """Exercise the CUDA branch of _analytical_chunk via stubbed mem_get_info.
+
+    Without this we can't reach gradient.py's torch.cuda.mem_get_info call
+    on a CPU-only CI runner — the helper short-circuits earlier."""
+    model, P = _vqe_model(N=4, reps=1)
+    grad_fn = BatchParameterShiftGradient(model, chunk_size="auto", backend="jax")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info",
+        lambda *a, **k: (40 * 1024 ** 3, 40 * 1024 ** 3),  # 40 GB free
+    )
+
+    result = grad_fn._analytical_chunk(P, upper=P)
+    assert 1 <= result <= P
+
+
 def test_vqe_probe_reraises_non_oom_errors(monkeypatch):
     """The probe must not swallow errors that aren't OOM — it's supposed
     to binary-search on memory failures, not hide genuine bugs."""
@@ -267,19 +345,94 @@ def test_qml_max_ps_chunk_validation():
 
 
 def test_qml_max_ps_chunk_clamps_auto_tune_on_cpu():
-    """On CPU, auto_tune sets self.batch_size=N and _ps_chunk=n_trainable.
-    max_ps_chunk must still clamp on top of that."""
+    """On CPU, auto_tune skips the GPU probes. max_ps_chunk must still
+    clamp the cached ps_chunk so the gradient path honours the ceiling."""
     model = _qml_model(n_qubits=3, n_layers=2, max_ps_chunk=2)
-    # The CPU branch of auto_tune returns early — it doesn't populate
-    # _ps_chunk_cache. Instead we verify the override is stored and
-    # available to the gradient path.
     assert model._max_ps_chunk == 2
+
+    model.auto_tune(N=5)
+    assert model._ps_chunk_cache == {5: 2}
+    assert model._ps_chunk == 2
+
+
+def test_qml_auto_tune_on_cpu_no_max_ps_chunk_uses_n_trainable():
+    """CPU branch without max_ps_chunk caches ps_chunk = n_trainable."""
+    model = _qml_model(n_qubits=3, n_layers=2)
+    model.auto_tune(N=4)
+    assert model._ps_chunk_cache == {4: model.n_trainable}
 
 
 def test_qml_auto_tune_rejects_invalid_probe():
     model = _qml_model(n_qubits=3, n_layers=1)
     with pytest.raises(ValueError, match="probe"):
         model.auto_tune(4, probe="bogus")
+
+
+def _patch_cuda_auto_tune(monkeypatch, model, batch_size):
+    """Trick auto_tune into believing it's on a GPU without actually using one.
+
+    Replaces ``torch.device`` so ``dev.type == "cuda"``, redirects the
+    dummy ``torch.zeros`` allocation to CPU, and stubs ``auto_batch_size``
+    so the torch probe (which would touch GPU memory) never runs.
+    """
+    import qiskit_trev.qml as qml_mod
+    import qiskit_trev.optimization.auto_batch as ab
+
+    class _FakeDev:
+        type = "cuda"
+
+    real_zeros = torch.zeros
+
+    def _cpu_zeros(*a, **k):
+        k.pop("device", None)
+        return real_zeros(*a, **k)
+
+    monkeypatch.setattr(model, "device", "cuda")
+    monkeypatch.setattr(qml_mod.torch, "device", lambda *a, **k: _FakeDev())
+    monkeypatch.setattr(qml_mod.torch, "zeros", _cpu_zeros)
+    monkeypatch.setattr(ab, "auto_batch_size", lambda *a, **k: batch_size)
+
+
+@pytest.mark.parametrize("probe_mode,expected", [
+    ("analytical", 3),  # analytical estimator returns 3
+    ("none", 5),        # uses torch-derived ps_chunk = batch_size // (2*N)
+])
+def test_qml_cuda_auto_tune_branches(monkeypatch, probe_mode, expected):
+    """Cover the GPU branch of auto_tune for ``probe="analytical"`` and
+    ``probe="none"``. Uses a fake CUDA device to avoid needing real hardware."""
+    model = _qml_model(n_qubits=3, n_layers=2, backend="jax")  # n_trainable=6
+    N = 4
+    _patch_cuda_auto_tune(monkeypatch, model, batch_size=2 * N * 5)
+    monkeypatch.setattr(model, "_analytical_ps_chunk", lambda N_: 3)
+
+    model.auto_tune(N, probe=probe_mode)
+
+    assert model._ps_chunk_cache == {N: expected}
+
+
+def test_qml_cuda_auto_tune_jit_probe(monkeypatch):
+    """probe='jit' on the GPU branch invokes _probe_jax_ps_chunk."""
+    model = _qml_model(n_qubits=3, n_layers=2, backend="jax")
+    N = 4
+    _patch_cuda_auto_tune(monkeypatch, model, batch_size=2 * N * 5)
+    monkeypatch.setattr(model, "_probe_jax_ps_chunk", lambda N_, upper: 4)
+
+    model.auto_tune(N, probe="jit")
+
+    assert model._ps_chunk_cache == {N: 4}
+
+
+def test_qml_cuda_auto_tune_max_ps_chunk_overrides_probe(monkeypatch):
+    """max_ps_chunk on the GPU branch must clamp the analytical/jit result."""
+    model = _qml_model(n_qubits=3, n_layers=2, backend="jax", max_ps_chunk=2)
+    N = 4
+    _patch_cuda_auto_tune(monkeypatch, model, batch_size=2 * N * 5)
+    # Analytical would propose 5 — override caps at 2.
+    monkeypatch.setattr(model, "_analytical_ps_chunk", lambda N_: 5)
+
+    model.auto_tune(N)
+
+    assert model._ps_chunk_cache == {N: 2}
 
 
 def test_qml_analytical_estimator_is_bounded(monkeypatch):
