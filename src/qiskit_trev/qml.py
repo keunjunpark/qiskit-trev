@@ -19,6 +19,7 @@ from torch import Tensor
 from qiskit.circuit import QuantumCircuit
 from qiskit.quantum_info import SparsePauliOp
 
+from .backend._cache_utils import canonical_shift
 from .converter import circuit_to_gate_instructions, sparse_pauli_op_to_hamiltonian
 from .gradient import _resolve_backend_pref, _VALID_BACKENDS
 from .tensor_ring.state import TensorRingState
@@ -706,7 +707,8 @@ class QMLModel:
             chunk_size = self.n_trainable
 
         cache_key = (
-            "param_shift", X_j.shape, theta_j.shape[0], shift, int(chunk_size)
+            "param_shift", X_j.shape, theta_j.shape[0],
+            canonical_shift(shift), int(chunk_size),
         )
         jit_fn = self._jax_jit_cache.get(cache_key)
         if jit_fn is None:

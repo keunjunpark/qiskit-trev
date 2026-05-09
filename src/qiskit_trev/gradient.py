@@ -12,6 +12,7 @@ import torch
 import torch.multiprocessing as mp
 from torch import Tensor
 
+from .backend._cache_utils import canonical_shift
 from .model import TensorRingModel
 from .tensor_ring.state import TensorRingState
 from .measure.efficient_contraction import (
@@ -550,7 +551,7 @@ class BatchParameterShiftGradient:
 
         model = self._model
         shift = self._shift
-        cache_key = ("single", id(model), shift, P)
+        cache_key = ("single", id(model), canonical_shift(shift), P)
         jit_fn = cache.get(cache_key)
         if jit_fn is None:
             paulis, coeffs, Z_op, I_op = self._jax_grad_constants()
@@ -629,8 +630,10 @@ class BatchParameterShiftGradient:
                 return (evs[:C] - evs[C:]) / denom
             return jax.jit(_chunk_grad)
 
+        shift_key = canonical_shift(shift)
+
         def _get_or_build(C: int):
-            key = ("chunk", id(model), shift, P, C)
+            key = ("chunk", id(model), shift_key, P, C)
             fn = cache.get(key)
             if fn is None:
                 fn = _make_chunk_kernel(C, P)

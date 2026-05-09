@@ -44,3 +44,6 @@ plan/
 
 # Issue / PR draft scratchpads (local-only; paste into GitHub when filing)
 issues/
+
+# Local-only scratch / experiment outputs
+ignore/
