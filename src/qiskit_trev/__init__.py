@@ -19,6 +19,7 @@ from .optimization.cma_es import CMAES, minimize_cma_es
 from .qml import QMLModel
 
 __all__ = [
+    "required_rank",
     "TensorRingState",
     "GateInstruction",
     "TensorRingModel",
@@ -36,3 +37,5 @@ __all__ = [
     "sparse_pauli_op_to_hamiltonian",
     "QMLModel",
 ]
+
+from .auto_rank import required_rank  # noqa: E402
