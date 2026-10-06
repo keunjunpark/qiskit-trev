@@ -216,11 +216,17 @@ class TestComputeSingleNonZI:
 class TestGetGpuCount:
 
     def test_returns_zero_on_cpu(self):
-        """_get_gpu_count returns 0 when CUDA is unavailable (line 22)."""
+        """_get_gpu_count returns 0 when CUDA is unavailable.
+
+        Must make CUDA unavailable rather than assume the host has none; the
+        previous version asserted count == 0 unconditionally and so failed on
+        any machine with a GPU.
+        """
+        from unittest.mock import patch
         from qiskit_trev.gradient import _get_gpu_count
-        count = _get_gpu_count()
-        # Without GPU, should be 0
-        assert count == 0
+
+        with patch("torch.cuda.is_available", return_value=False):
+            assert _get_gpu_count() == 0
 
     def test_gpu_count_with_mocked_cuda(self):
         """_get_gpu_count returns device count when CUDA is available (line 24)."""

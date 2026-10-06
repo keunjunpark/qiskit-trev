@@ -72,7 +72,7 @@ def _get_gate_matrix(instr: GateInstruction, device: str) -> Tensor:
     elif name in _GATE_MAP_1P:
         return _GATE_MAP_1P[name](params[0], device=device)
     elif name == "U3":
-        p = torch.tensor(params, dtype=torch.float, device=device)
+        p = torch.tensor(params, dtype=gate_fns._angle_dtype(), device=device)
         return gate_fns.U3(p, device=device)
     elif name in _GATE_MAP_2Q_FIXED:
         return _GATE_MAP_2Q_FIXED[name](device=device)
@@ -151,6 +151,7 @@ class TensorRingState:
         self.rank = rank
         self.device = device
         self.dtype = dtype
+        gate_fns.set_gate_dtype(dtype)
 
     def build(self, gates: list[GateInstruction]) -> Tensor:
         """Build the tensor ring state by applying gates sequentially.
