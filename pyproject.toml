@@ -24,7 +24,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "qiskit>=1.0",
+    "qiskit>=1.0,<3",
     "numpy>=1.23.0",
     "torch>=2.0.0",
 ]
