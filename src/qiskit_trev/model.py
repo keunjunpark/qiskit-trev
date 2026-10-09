@@ -36,11 +36,25 @@ class TensorRingModel(torch.nn.Module):
         circuit: QuantumCircuit,
         observable: SparsePauliOp,
         *,
-        rank: int = 10,
+        rank: "int | str" = 10,
         device: str = "cpu",
         dtype: torch.dtype = torch.cfloat,
     ):
         super().__init__()
+        # rank="auto" is OPT-IN: pass the string to use the computed
+        # exact-representation bound. rank=<int> is unchanged, and the default
+        # (10) is untouched -- note though that 10 is above the bound at depth
+        # 2-3 and below it at depth 4+, so it is not right for any depth.
+        self.rank_source = "explicit"
+        if isinstance(rank, str):
+            if rank != "auto":
+                raise ValueError(f"rank must be an int or 'auto', got {rank!r}")
+            from .auto_rank import required_rank
+            self.rank_report = required_rank(circuit)
+            rank = self.rank_report["chi"]
+            self.rank_source = "auto"
+        else:
+            self.rank_report = None
         self.rank = rank
         self.device_str = device
         self.dtype = dtype

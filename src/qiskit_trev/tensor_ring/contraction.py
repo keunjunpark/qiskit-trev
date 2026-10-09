@@ -69,7 +69,7 @@ def apply_double_qubit_gate(
     u, s, v = torch.linalg.svd(mps, full_matrices=False)
     k = min(max_rank, len(s))
     x = u[:, :k]
-    sx = torch.diag(s[:k]).to(torch.cfloat)
+    sx = torch.diag(s[:k]).to(core_a.dtype)
     y = v[:k, :]
 
     # Split back into two cores
@@ -139,10 +139,12 @@ def apply_double_qubit_gate_batch(
     mps = mps.permute(0, 3, 1, 4, 2).reshape(B, 2 * chi1, 2 * chi3)
 
     # Batched SVD
-    u, s, vh = torch.linalg.svd(mps)
+    # full_matrices=False matches the sequential path and avoids materialising
+    # the square (2*chi, 2*chi) factors.
+    u, s, vh = torch.linalg.svd(mps, full_matrices=False)
     k = min(max_rank, s.shape[-1])
     x = u[:, :, :k]
-    sx = torch.diag_embed(s[:, :k]).to(torch.cfloat)
+    sx = torch.diag_embed(s[:, :k]).to(core_a_batch.dtype)
     y = vh[:, :k, :]
 
     new_a = torch.bmm(x, sx).reshape(B, 2, chi1, k).permute(0, 2, 3, 1)

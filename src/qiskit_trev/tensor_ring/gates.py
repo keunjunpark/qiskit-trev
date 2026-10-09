@@ -7,64 +7,86 @@ All functions return torch.cfloat tensors.
 import math
 
 import torch
+
+# Working complex dtype for gate matrices. Previously hardcoded to cfloat, which
+# silently downcast cdouble states -- the library could not run in double
+# precision at all. TensorRingState sets this.
+_GATE_DTYPE = torch.cfloat
+
+
+def set_gate_dtype(dtype: "torch.dtype") -> None:
+    """Set the complex dtype used for all gate matrices."""
+    global _GATE_DTYPE
+    _GATE_DTYPE = dtype
+
+
+def _angle_dtype() -> "torch.dtype":
+    """Real dtype for rotation angles, matching the complex working dtype.
+
+    Rotation angles were previously cast to ``torch.float`` (float32) before
+    cos/sin and only then promoted to the complex dtype, so a cdouble state
+    still carried single-precision gate entries -- a ~2.4e-07 floor on gradient
+    accuracy even in "double precision".
+    """
+    return torch.float64 if _GATE_DTYPE == torch.cdouble else torch.float32
 from torch import Tensor
 
 
 def I(device: str = None) -> Tensor:
-    return torch.eye(2, dtype=torch.cfloat, device=device)
+    return torch.eye(2, dtype=_GATE_DTYPE, device=device)
 
 
 def X(device: str = None) -> Tensor:
-    return torch.tensor([[0, 1], [1, 0]], dtype=torch.cfloat, device=device)
+    return torch.tensor([[0, 1], [1, 0]], dtype=_GATE_DTYPE, device=device)
 
 
 def Y(device: str = None) -> Tensor:
-    return torch.tensor([[0, -1j], [1j, 0]], dtype=torch.cfloat, device=device)
+    return torch.tensor([[0, -1j], [1j, 0]], dtype=_GATE_DTYPE, device=device)
 
 
 def Z(device: str = None) -> Tensor:
-    return torch.tensor([[1, 0], [0, -1]], dtype=torch.cfloat, device=device)
+    return torch.tensor([[1, 0], [0, -1]], dtype=_GATE_DTYPE, device=device)
 
 
 def H(device: str = None) -> Tensor:
     return (1 / math.sqrt(2)) * torch.tensor(
-        [[1, 1], [1, -1]], dtype=torch.cfloat, device=device
+        [[1, 1], [1, -1]], dtype=_GATE_DTYPE, device=device
     )
 
 
 def RX(theta, device: str = None) -> Tensor:
     is_scalar = not isinstance(theta, torch.Tensor) or theta.dim() == 0
-    theta = torch.atleast_1d(torch.as_tensor(theta, dtype=torch.float))
+    theta = torch.atleast_1d(torch.as_tensor(theta, dtype=_angle_dtype()))
     cos = torch.cos(theta / 2)
     sin = torch.sin(theta / 2)
     rx = torch.stack([
         torch.stack([cos, -1j * sin], dim=-1),
         torch.stack([-1j * sin, cos], dim=-1),
-    ], dim=-2).to(device=device, dtype=torch.cfloat)
+    ], dim=-2).to(device=device, dtype=_GATE_DTYPE)
     return rx[0] if is_scalar else rx
 
 
 def RY(theta, device: str = None) -> Tensor:
     is_scalar = not isinstance(theta, torch.Tensor) or theta.dim() == 0
-    theta = torch.atleast_1d(torch.as_tensor(theta, dtype=torch.float))
+    theta = torch.atleast_1d(torch.as_tensor(theta, dtype=_angle_dtype()))
     cos = torch.cos(theta / 2)
     sin = torch.sin(theta / 2)
     ry = torch.stack([
         torch.stack([cos, -sin], dim=-1),
         torch.stack([sin, cos], dim=-1),
-    ], dim=-2).to(device=device, dtype=torch.cfloat)
+    ], dim=-2).to(device=device, dtype=_GATE_DTYPE)
     return ry[0] if is_scalar else ry
 
 
 def RZ(theta, device: str = None) -> Tensor:
     is_scalar = not isinstance(theta, torch.Tensor) or theta.dim() == 0
-    theta = torch.atleast_1d(torch.as_tensor(theta, dtype=torch.float))
+    theta = torch.atleast_1d(torch.as_tensor(theta, dtype=_angle_dtype()))
     exp_m = torch.exp(-1j * theta / 2)
     exp_p = torch.exp(1j * theta / 2)
     rz = torch.stack([
         torch.stack([exp_m, torch.zeros_like(theta)], dim=-1),
         torch.stack([torch.zeros_like(theta), exp_p], dim=-1),
-    ], dim=-2).to(device=device, dtype=torch.cfloat)
+    ], dim=-2).to(device=device, dtype=_GATE_DTYPE)
     return rz[0] if is_scalar else rz
 
 
@@ -89,7 +111,7 @@ def U3(params: Tensor, device: str = None) -> Tensor:
     mat = torch.stack([
         torch.stack([u00, u01], dim=-1),
         torch.stack([u10, u11], dim=-1),
-    ], dim=-2).to(device=device, dtype=torch.cfloat)
+    ], dim=-2).to(device=device, dtype=_GATE_DTYPE)
     return mat[0] if is_scalar else mat
 
 
@@ -99,7 +121,7 @@ def CNOT(device: str = None) -> Tensor:
         [0, 1, 0, 0],
         [0, 0, 0, 1],
         [0, 0, 1, 0],
-    ], dtype=torch.cfloat, device=device)
+    ], dtype=_GATE_DTYPE, device=device)
 
 
 def SWAP(device: str = None) -> Tensor:
@@ -108,13 +130,13 @@ def SWAP(device: str = None) -> Tensor:
         [0, 0, 1, 0],
         [0, 1, 0, 0],
         [0, 0, 0, 1],
-    ], dtype=torch.cfloat, device=device)
+    ], dtype=_GATE_DTYPE, device=device)
 
 
 def ZZ(theta, device: str = None) -> Tensor:
     """ZZ(theta) = diag(e^{-i*theta/2}, e^{i*theta/2}, e^{i*theta/2}, e^{-i*theta/2})."""
     is_scalar = not isinstance(theta, torch.Tensor) or theta.dim() == 0
-    theta = torch.atleast_1d(torch.as_tensor(theta, dtype=torch.float))
+    theta = torch.atleast_1d(torch.as_tensor(theta, dtype=_angle_dtype()))
     a = torch.exp(-1j * theta / 2)
     b = torch.exp(1j * theta / 2)
     z = torch.zeros_like(theta)
@@ -123,7 +145,7 @@ def ZZ(theta, device: str = None) -> Tensor:
     row2 = torch.stack([z, z, b, z], dim=-1)
     row3 = torch.stack([z, z, z, a], dim=-1)
     mat = torch.stack([row0, row1, row2, row3], dim=-2).to(
-        dtype=torch.cfloat, device=device
+        dtype=_GATE_DTYPE, device=device
     )
     return mat[0] if is_scalar else mat
 
@@ -131,7 +153,7 @@ def ZZ(theta, device: str = None) -> Tensor:
 def ZZ_SWAP(theta, device: str = None) -> Tensor:
     """ZZ_SWAP(theta) = SWAP . ZZ(theta)."""
     is_scalar = not isinstance(theta, torch.Tensor) or theta.dim() == 0
-    theta = torch.atleast_1d(torch.as_tensor(theta, dtype=torch.float))
+    theta = torch.atleast_1d(torch.as_tensor(theta, dtype=_angle_dtype()))
     a = torch.exp(-1j * theta / 2)
     b = torch.exp(1j * theta / 2)
     z = torch.zeros_like(theta)
@@ -140,6 +162,6 @@ def ZZ_SWAP(theta, device: str = None) -> Tensor:
     row2 = torch.stack([z, b, z, z], dim=-1)
     row3 = torch.stack([z, z, z, a], dim=-1)
     mat = torch.stack([row0, row1, row2, row3], dim=-2).to(
-        dtype=torch.cfloat, device=device
+        dtype=_GATE_DTYPE, device=device
     )
     return mat[0] if is_scalar else mat

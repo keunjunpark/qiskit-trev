@@ -37,21 +37,24 @@ def expectation_value(
     """
     device = tensor.device
     N = tensor.shape[0]
+    # Work in the state's own precision; hardcoding cfloat here downcast
+    # cdouble states.
+    cdt = tensor.dtype if tensor.is_complex() else torch.cfloat
 
     paulis = hamiltonian.get_bool_pauli_tensor().to(device)  # (T, N)
     T = paulis.shape[0]
 
     coeffs = torch.as_tensor(
-        hamiltonian.coefficients, dtype=torch.cfloat, device=device
+        hamiltonian.coefficients, dtype=cdt, device=device
     )
 
-    Z_op = torch.tensor([[1, 0], [0, -1]], dtype=torch.cfloat, device=device)
-    I_op = torch.eye(2, dtype=torch.cfloat, device=device)
+    Z_op = torch.tensor([[1, 0], [0, -1]], dtype=cdt, device=device)
+    I_op = torch.eye(2, dtype=cdt, device=device)
 
     if chunk_size is None:
         chunk_size = T
 
-    total = torch.zeros((), dtype=torch.cfloat, device=device)
+    total = torch.zeros((), dtype=cdt, device=device)
 
     for start in range(0, T, chunk_size):
         stop = min(start + chunk_size, T)
@@ -120,6 +123,14 @@ def batched_expectation_value(
     Z_op = backend.tensor([[1, 0], [0, -1]], device=device)
     I_op = backend.eye(2, device=device)
     total_init = backend.zeros(B, device=device)
+
+    # Match the state's precision (the backend's complex_dtype is cfloat).
+    if getattr(batch_tensor, "is_complex", lambda: False)():
+        _cdt = batch_tensor.dtype
+        coeffs, Z_op, I_op, total_init = (
+            x.to(_cdt) if hasattr(x, "to") else x
+            for x in (coeffs, Z_op, I_op, total_init)
+        )
 
     return _batched_expectation_kernel(
         backend, batch_tensor, paulis, coeffs, Z_op, I_op, total_init, chunk_size
